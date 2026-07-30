@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { ROOT, tempDir, removeTempDir } from "./helpers.mjs";
-import { packagePlugin } from "../scripts/package-plugin.mjs";
+import { archiveContent, packagePlugin } from "../scripts/package-plugin.mjs";
 import { validateStore } from "../scripts/store-validate.mjs";
 
 test("store submission material passes the release gate", () => {
@@ -15,6 +15,18 @@ test("store submission material passes the release gate", () => {
   assert.equal(result.negativeTests, 3);
   assert.ok(result.files.length > 0);
   assert.ok(result.bytes > 0);
+});
+
+test("packaging normalizes text line endings without changing binary content", (t) => {
+  const dir = tempDir("grok-package-content-");
+  t.after(() => removeTempDir(dir));
+  const textFile = path.join(dir, "fixture.md");
+  const binaryFile = path.join(dir, "fixture.bin");
+  fs.writeFileSync(textFile, "first\r\nsecond\rthird\n", "utf8");
+  fs.writeFileSync(binaryFile, Buffer.from([0, 13, 10, 255]));
+
+  assert.equal(archiveContent(textFile).toString("utf8"), "first\nsecond\nthird\n");
+  assert.deepEqual(archiveContent(binaryFile), Buffer.from([0, 13, 10, 255]));
 });
 
 test("plugin packaging is deterministic and has one plugin root", async (t) => {

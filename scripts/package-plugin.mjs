@@ -9,9 +9,18 @@ import { validateStore } from "./store-validate.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const FIXED_DATE = new Date("1980-01-01T00:00:00.000Z");
+const TEXT_EXTENSIONS = new Set([".json", ".md", ".mjs", ".svg", ".yaml", ".yml"]);
 
 function normalizedRelative(root, file) {
   return path.relative(root, file).replaceAll("\\", "/");
+}
+
+export function archiveContent(file) {
+  const content = fs.readFileSync(file);
+  if (!TEXT_EXTENSIONS.has(path.extname(file).toLowerCase())) {
+    return content;
+  }
+  return Buffer.from(content.toString("utf8").replace(/\r\n?/g, "\n"), "utf8");
 }
 
 export function verifyPluginZip(zipPath, expectedNames, expectedRoot) {
@@ -97,7 +106,7 @@ export async function packagePlugin(options = {}) {
   });
   archive.pipe(output);
   for (const file of validation.files) {
-    archive.append(fs.readFileSync(file), {
+    archive.append(archiveContent(file), {
       name: `${manifest.name}/${normalizedRelative(validation.pluginRoot, file)}`,
       date: FIXED_DATE,
       mode: 0o100644
