@@ -1,6 +1,6 @@
 {
   "name": "@mmm1h/codex-grok-companion",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "Use the local Grok CLI from Codex for reviews, delegated coding tasks, and background jobs.",
@@ -10,6 +10,14 @@
   },
   "scripts": {
     "test": "node --test",
-    "test:smoke": "node plugins/grok-companion/scripts/grok-companion.mjs setup --json"
+    "test:smoke": "node plugins/grok-companion/scripts/grok-companion.mjs setup --json",
+    "test:store": "node scripts/store-validate.mjs",
+    "package:plugin": "node scripts/package-plugin.mjs",
+    "audit": "npm audit --audit-level=high"
+  },
+  "devDependencies": {
+    "archiver": "^8.0.0",
+    "yaml": "^2.8.0",
+    "yauzl": "^3.4.0"
   }
 }

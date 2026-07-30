@@ -1,6 +1,6 @@
 {
   "name": "grok-companion",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Use the local Grok CLI from Codex for code review, delegated coding tasks, and tracked background jobs.",
   "author": {
     "name": "mmm1h",
@@ -13,12 +13,19 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Grok Companion",
-    "shortDescription": "Consult Grok for reviews and coding tasks",
-    "longDescription": "Run structured read-only reviews, delegate coding work, and manage durable background Grok jobs through the local Grok CLI. The same plugin works in Codex CLI and Codex in the ChatGPT desktop app.",
+    "shortDescription": "Review and delegate with Grok",
+    "longDescription": "Use the local Grok CLI for structured code reviews, delegated investigations and implementations, and durable background jobs. Requires Node.js, Git for reviews, and an authenticated Grok CLI on the same machine. Designed for Codex CLI and Codex in the ChatGPT desktop app; it does not run in ordinary Chat, mobile, the IDE extension, or hosted environments without the local CLI.",
     "developerName": "mmm1h",
     "category": "Developer Tools",
     "capabilities": ["Interactive", "Read", "Write"],
     "websiteURL": "https://github.com/mmm1h/codex-grok-companion",
+    "privacyPolicyURL": "https://github.com/mmm1h/codex-grok-companion/blob/v1.0.0/plugins/grok-companion/PRIVACY.md",
+    "termsOfServiceURL": "https://github.com/mmm1h/codex-grok-companion/blob/v1.0.0/plugins/grok-companion/TERMS.md",
+    "supportURL": "https://github.com/mmm1h/codex-grok-companion/issues",
+    "brandColor": "#0B6E4F",
+    "brandColorDark": "#5EE0B7",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/logo.svg",
     "defaultPrompt": [
       "Ask Grok to review my current changes.",
       "Delegate this investigation to Grok in the background.",

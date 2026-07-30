@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title>Grok Companion</title>
+  <rect width="128" height="128" rx="28" fill="#0B6E4F"/>
+  <path d="M28 35c0-7.2 5.8-13 13-13h35c7.2 0 13 5.8 13 13v20c0 7.2-5.8 13-13 13H59L42 83V68h-1c-7.2 0-13-5.8-13-13V35Z" fill="#FFFFFF"/>
+  <path d="M58 60h29c7.2 0 13 5.8 13 13v20c0 7.2-5.8 13-13 13h1v15l-18-15H58c-7.2 0-13-5.8-13-13V73c0-7.2 5.8-13 13-13Z" fill="#F4C95D"/>
+  <path d="m58 35 4 8 9 2-7 6 2 9-8-4-8 4 1-9-6-6 9-2 4-8Z" fill="#0B6E4F"/>
+  <path d="M62 80h22M62 91h14" fill="none" stroke="#0B6E4F" stroke-linecap="round" stroke-width="5"/>
+</svg>

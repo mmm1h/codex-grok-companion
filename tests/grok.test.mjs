@@ -11,6 +11,7 @@ import {
   getGrokAuthStatus,
   getGrokAvailability,
   getGrokCapabilities,
+  grokStopReasonError,
   isGrokAuthReady,
   MIN_GROK_CLI_VERSION,
   normalizeGrokStreamingEvent,
@@ -21,6 +22,13 @@ import {
 import { isProcessAlive } from "../plugins/grok-companion/scripts/lib/process.mjs";
 import { renderTaskResult } from "../plugins/grok-companion/scripts/lib/render.mjs";
 import { FAKE_GROK, tempDir } from "./helpers.mjs";
+
+test("stop reasons fail closed unless Grok confirms EndTurn", () => {
+  assert.equal(grokStopReasonError("EndTurn"), null);
+  assert.match(grokStopReasonError(null), /without a terminal stop reason/i);
+  assert.match(grokStopReasonError("Stop"), /without a complete result/i);
+  assert.match(grokStopReasonError("Cancelled"), /without a complete result/i);
+});
 
 test("read-only Grok argv uses plan mode and a strict tool allowlist", () => {
   const { args, sessionId } = buildGrokArgs({
@@ -118,6 +126,7 @@ test("parseGrokStructuredOutput prefers the last object when multi-turn outputs 
   }));
   assert.equal(enveloped.ok, true, enveloped.parseError);
   assert.deepEqual(enveloped.data, finalPayload);
+  assert.equal(enveloped.stopReason, "EndTurn");
 });
 
 test("getGrokCapabilities detects structured output and sandbox flags", () => {
@@ -339,6 +348,15 @@ test("empty auth.json is not credential evidence", (t) => {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   // A3: zero-byte auth.json must not count as configured
   fs.writeFileSync(path.join(dir, "auth.json"), "", "utf8");
+  const auth = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
+  assert.equal(auth.status, "needs_login");
+  assert.equal(isGrokAuthReady(auth), false);
+});
+
+test("whitespace-only credential files are not authentication evidence", (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "auth.json"), "  \r\n\t", "utf8");
   const auth = getGrokAuthStatus(dir, { grokHome: dir, env: {} });
   assert.equal(auth.status, "needs_login");
   assert.equal(isGrokAuthReady(auth), false);
@@ -709,7 +727,11 @@ test("streaming end.data final answer is collected without raw NDJSON fallback",
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const stream = [
     JSON.stringify({ type: "text", text: "partial " }),
-    JSON.stringify({ type: "end", data: { result: "final from end.data", sessionId: "99999999-9999-4999-8999-999999999999" } })
+    JSON.stringify({
+      type: "end",
+      stopReason: "EndTurn",
+      data: { result: "final from end.data", sessionId: "99999999-9999-4999-8999-999999999999" }
+    })
   ].join("\n");
   const result = await runGrokHeadless({
     cwd: dir,
@@ -725,7 +747,36 @@ test("streaming end.data final answer is collected without raw NDJSON fallback",
   });
   assert.equal(result.stdout, "final from end.data");
   assert.equal(result.sessionId, "99999999-9999-4999-8999-999999999999");
+  assert.equal(result.stopReason, "EndTurn");
   assert.doesNotMatch(result.stdout, /\"type\":/);
+});
+
+test("streaming collector preserves non-success stop reasons", async (t) => {
+  const dir = tempDir();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stream = [
+    JSON.stringify({ type: "text", data: "work in progress" }),
+    JSON.stringify({
+      type: "end",
+      stopReason: "Cancelled",
+      sessionId: "88888888-8888-4888-8888-888888888888"
+    })
+  ].join("\n");
+  const result = await runGrokHeadless({
+    cwd: dir,
+    prompt: "cancelled stream",
+    write: false,
+    outputFormat: "streaming-json",
+    binary: process.execPath,
+    binaryPrefixArgs: [FAKE_GROK],
+    env: { ...process.env, FAKE_GROK_STREAM: stream },
+    timeoutMs: 10_000,
+    skipSignalHandlers: true,
+    skipCapabilityCheck: true
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "work in progress");
+  assert.equal(result.stopReason, "Cancelled");
 });
 
 test("empty end keeps accumulated assistant text", async (t) => {

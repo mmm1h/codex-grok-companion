@@ -2,3 +2,7 @@ interface:
   display_name: "Grok Adversarial Review"
   short_description: "Challenge code changes and design choices with Grok"
   default_prompt: "Use $grok-adversarial-review to challenge the current implementation and its risks."
+
+policy:
+  products:
+    - CODEX

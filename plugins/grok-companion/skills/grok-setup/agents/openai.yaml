@@ -2,3 +2,7 @@ interface:
   display_name: "Grok Setup"
   short_description: "Check local Grok CLI readiness and authentication"
   default_prompt: "Use $grok-setup to check whether the local Grok CLI is ready."
+
+policy:
+  products:
+    - CODEX

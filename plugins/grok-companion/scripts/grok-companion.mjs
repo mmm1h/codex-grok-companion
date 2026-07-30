@@ -13,6 +13,7 @@ import {
   getGrokAuthStatus,
   getGrokAvailability,
   getGrokCapabilities,
+  grokStopReasonError,
   isGrokAuthReady,
   parseGrokStructuredOutput,
   runGrokHeadless
@@ -376,14 +377,16 @@ async function executeReview(request, onProgress) {
   });
   const parsed = parseGrokStructuredOutput(result.stdout);
   const validationError = parsed.ok ? validateReviewResult(parsed.data) : null;
-  const parseError = parsed.ok
+  const stopReasonError = result.exitCode === 0 ? grokStopReasonError(parsed.stopReason) : null;
+  const parseError = stopReasonError || (parsed.ok
     ? (validationError ? `Structured review validation failed: ${validationError}` : null)
-    : parsed.parseError;
+    : parsed.parseError);
   const exitCode = result.exitCode === 0 && parseError ? 1 : result.exitCode;
   const payload = {
     exitCode,
     sessionId: result.sessionId,
     sessionConfirmed: result.sessionConfirmed,
+    stopReason: parsed.stopReason ?? null,
     result: parsed.ok ? parsed.data : null,
     rawOutput: result.stdout.trimEnd(),
     parseError,
@@ -420,10 +423,13 @@ async function executeTask(request, onProgress, onTelemetry) {
     onTelemetry,
     timeoutMs: request.timeoutMs
   });
+  const stopReasonError = result.exitCode === 0 ? grokStopReasonError(result.stopReason) : null;
+  const exitCode = result.exitCode === 0 && stopReasonError ? 1 : result.exitCode;
   const payload = {
-    exitCode: result.exitCode,
+    exitCode,
     sessionId: result.sessionId,
     sessionConfirmed: result.sessionConfirmed,
+    stopReason: result.stopReason,
     rawOutput: result.stdout.trimEnd(),
     rawStreamingOutput: result.rawStdout.trimEnd(),
     stderr: result.stderr.trimEnd(),
@@ -433,12 +439,14 @@ async function executeTask(request, onProgress, onTelemetry) {
     resumed: Boolean(request.resumeSessionId)
   };
   return {
-    exitCode: result.exitCode,
+    exitCode,
     sessionId: result.sessionId,
     sessionConfirmed: result.sessionConfirmed,
     payload,
     rendered: renderTaskResult(payload, { title: request.title }),
-    errorMessage: result.exitCode === 0 ? null : (result.stderr.trim() || `Grok exited with ${result.exitCode}.`)
+    errorMessage: exitCode === 0
+      ? null
+      : (stopReasonError || result.stderr.trim() || `Grok exited with ${result.exitCode}.`)
   };
 }
 

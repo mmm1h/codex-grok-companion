@@ -192,14 +192,26 @@ if (process.env.FAKE_GROK_FAIL_BEFORE_SESSION !== "1") {
     } else {
       const body = [
         `${JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: output }] }, session_id: sessionId })}\n`,
-        `${JSON.stringify({ type: "result", subtype: "success", result: output, session_id: sessionId })}\n`
+        `${JSON.stringify({
+          type: "result",
+          subtype: "success",
+          result: output,
+          stopReason: "EndTurn",
+          session_id: sessionId
+        })}\n`
       ].join("");
       await writeStdoutBody(body);
     }
   } else {
     const plainBody = process.env.FAKE_GROK_OUTPUT != null
       ? `${process.env.FAKE_GROK_OUTPUT}\n`
-      : (jsonSchemaIndex === -1 ? `${output}\n` : `${JSON.stringify(defaultStructuredOutput)}\n`);
+      : (jsonSchemaIndex === -1
+        ? `${output}\n`
+        : `${JSON.stringify({
+          text: JSON.stringify(defaultStructuredOutput),
+          stopReason: "EndTurn",
+          sessionId
+        })}\n`);
     await writeStdoutBody(plainBody);
   }
 

@@ -2,3 +2,7 @@ interface:
   display_name: "Grok Jobs"
   short_description: "Inspect and manage tracked background Grok jobs"
   default_prompt: "Use $grok-jobs to show the status of recent Grok jobs."
+
+policy:
+  products:
+    - CODEX

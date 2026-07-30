@@ -826,13 +826,9 @@ export function exportJobBundle(cwd, reference, options = {}) {
   if (!options.out) {
     throw new Error("Export requires an explicit output path.");
   }
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reconciledJobs(workspaceRoot));
-  const selected = matchReference(jobs, reference);
-  if (!selected) {
-    throw new Error(`No job found for "${reference}".`);
-  }
+  const { workspaceRoot, job: selected } = resolveResultJob(cwd, reference);
   const stored = readStoredJob(workspaceRoot, selected.id) ?? selected;
+  const { request: _request, ...safeStored } = stored;
   const logPath = stored.logPath || resolveJobLogFile(workspaceRoot, selected.id);
   let logText = null;
   if (logPath && fs.existsSync(logPath)) {
@@ -841,7 +837,7 @@ export function exportJobBundle(cwd, reference, options = {}) {
   const bundle = {
     exportedAt: nowIso(),
     workspaceRoot,
-    job: stored,
+    job: safeStored,
     log: logText
   };
 

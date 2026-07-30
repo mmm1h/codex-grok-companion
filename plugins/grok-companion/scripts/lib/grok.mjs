@@ -208,10 +208,23 @@ export function assertGrokCliCompatible(cwd, options = {}) {
 }
 
 function hasNonEmptyFile(file) {
+  const maxEvidenceBytes = 64 * 1024;
+  let descriptor = null;
   try {
-    return fs.statSync(file).isFile() && fs.statSync(file).size > 0;
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size === 0 || stat.size > maxEvidenceBytes) {
+      return false;
+    }
+    descriptor = fs.openSync(file, "r");
+    const buffer = Buffer.allocUnsafe(stat.size);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, stat.size, 0);
+    return buffer.toString("utf8", 0, bytesRead).trim().length > 0;
   } catch {
     return false;
+  } finally {
+    if (descriptor != null) {
+      fs.closeSync(descriptor);
+    }
   }
 }
 
@@ -598,6 +611,37 @@ function selectPreferredStructuredValue(values) {
   return values[values.length - 1];
 }
 
+function structuredStopReason(value, depth = 0) {
+  if (!value || typeof value !== "object" || depth > 8) {
+    return null;
+  }
+  const direct = value.stopReason ?? value.stop_reason;
+  if (typeof direct === "string" && direct.trim()) {
+    return direct.trim();
+  }
+  for (const field of STRUCTURED_OUTPUT_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(value, field)) {
+      const nested = structuredStopReason(value[field], depth + 1);
+      if (nested) {
+        return nested;
+      }
+    }
+  }
+  return null;
+}
+
+export function grokStopReasonError(stopReason) {
+  const value = String(stopReason ?? "").trim();
+  if (!value) {
+    return "Grok exited without a terminal stop reason; refusing to treat partial output as success.";
+  }
+  const normalized = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (normalized === "endturn") {
+    return null;
+  }
+  return `Grok ended without a complete result (stop reason: ${value}).`;
+}
+
 export function parseGrokStructuredOutput(stdout) {
   const raw = String(stdout ?? "");
   if (!raw.trim()) {
@@ -643,7 +687,7 @@ export function parseGrokStructuredOutput(stdout) {
       }
     }
     const data = extractStructuredObject(root);
-    return { ok: true, data, raw };
+    return { ok: true, data, stopReason: structuredStopReason(root), raw };
   } catch (error) {
     return {
       ok: false,
@@ -751,6 +795,18 @@ function streamSessionId(event) {
   return values.find((value) => typeof value === "string" && /^[0-9a-f-]{32,36}$/i.test(value)) ?? null;
 }
 
+function streamStopReason(event) {
+  const values = [
+    event?.stopReason,
+    event?.stop_reason,
+    event?.data?.stopReason,
+    event?.data?.stop_reason,
+    event?.result?.stopReason,
+    event?.result?.stop_reason
+  ];
+  return values.find((value) => typeof value === "string" && value.trim())?.trim() ?? null;
+}
+
 export function normalizeGrokStreamingEvent(event, at = new Date().toISOString()) {
   if (!event || typeof event !== "object" || Array.isArray(event)) {
     return null;
@@ -809,6 +865,7 @@ export function normalizeGrokStreamingEvent(event, at = new Date().toISOString()
 function createStreamingCollector(options = {}) {
   let pending = "";
   let observedSessionId = null;
+  let stopReason = null;
   const finalTexts = [];
   const assistantTexts = [];
   const warnedUnknownTypes = new Set();
@@ -839,6 +896,7 @@ function createStreamingCollector(options = {}) {
     const known = KNOWN_STREAM_EVENT_TYPES.test(telemetry.eventType);
 
     if (/result|final|complete|^end$/.test(type)) {
+      stopReason = streamStopReason(event) ?? stopReason;
       // Prefer explicit final fields (including event.data); empty end keeps assistant text.
       const finalText = collectStreamText(event);
       if (finalText.trim()) {
@@ -891,7 +949,8 @@ function createStreamingCollector(options = {}) {
       if (finalText || assistantText) {
         return {
           stdout: finalText || assistantText,
-          observedSessionId
+          observedSessionId,
+          stopReason
         };
       }
       const raw = String(rawOutput ?? "").trimEnd();
@@ -902,6 +961,7 @@ function createStreamingCollector(options = {}) {
       return {
         stdout: "",
         observedSessionId,
+        stopReason,
         rawSuppressed: Boolean(raw)
       };
     }
@@ -1073,6 +1133,7 @@ export async function runGrokHeadless(options = {}) {
       args: built.args,
       sessionId: observedSessionId ?? built.sessionId,
       sessionConfirmed: Boolean(observedSessionId || options.sessionConfirmed),
+      stopReason: collected.stopReason ?? null,
       durationMs: Date.now() - startedAt
     };
   } finally {

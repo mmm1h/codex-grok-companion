@@ -2,3 +2,7 @@ interface:
   display_name: "Delegate to Grok"
   short_description: "Delegate investigation or implementation to Grok"
   default_prompt: "Use $grok-delegate to hand this coding task to the local Grok CLI."
+
+policy:
+  products:
+    - CODEX

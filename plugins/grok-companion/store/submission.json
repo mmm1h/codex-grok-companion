@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "submissionType": "skills-only",
+  "supportedProducts": ["CODEX"],
+  "supportedSurfaces": [
+    "Codex CLI",
+    "Codex in the ChatGPT desktop app"
+  ],
+  "unsupportedSurfaces": [
+    "ordinary Chat",
+    "mobile",
+    "IDE extension",
+    "hosted environments without the local Grok CLI"
+  ],
+  "prerequisites": [
+    "Node.js 18.18 or newer",
+    "Grok CLI 0.2.0 or newer with --json-schema and --sandbox",
+    "Git for review workflows",
+    "Authentication for the user-configured Grok provider"
+  ],
+  "initialReleaseNotes": "Initial public release of local Grok reviews, delegated read-only or write-authorized coding tasks, and durable background job management for Codex.",
+  "positiveTests": [
+    {
+      "id": "positive-setup",
+      "prompt": "Use $grok-setup to check whether my local Grok CLI is ready.",
+      "setup": "Run on a supported Codex surface with Node.js and an authenticated compatible Grok CLI installed.",
+      "expectedBehavior": "Runs the offline setup check without sending a model prompt or exposing credential values.",
+      "expectedResult": "Reports ready=true, detected capabilities, authentication evidence status, and the local state directory."
+    },
+    {
+      "id": "positive-review",
+      "prompt": "Use $grok-review to review my current Git working tree and wait for the result.",
+      "setup": "Use a Git repository with a small uncommitted change and a ready Grok CLI.",
+      "expectedBehavior": "Collects the bounded Git diff and invokes Grok in the read-only review sandbox with structured output.",
+      "expectedResult": "Returns verdict, summary, findings, next steps, and fails if Grok does not finish successfully."
+    },
+    {
+      "id": "positive-adversarial",
+      "prompt": "Use $grok-adversarial-review to challenge rollback safety and failure handling in my current changes.",
+      "setup": "Use a Git repository with relevant changes and a ready Grok CLI.",
+      "expectedBehavior": "Passes the focus through a UTF-8 file and performs a read-only structured adversarial review.",
+      "expectedResult": "Returns prioritized challenges grounded in the changes, failure modes, and concrete follow-up checks."
+    },
+    {
+      "id": "positive-background-task",
+      "prompt": "Use $grok-delegate to investigate this test failure read-only in the background, then show its status.",
+      "setup": "Use a local repository and a ready Grok CLI.",
+      "expectedBehavior": "Queues a detached read-only task, reports its job ID, and uses that explicit ID for status retrieval.",
+      "expectedResult": "Shows progress followed by a terminal result with status, output, and recovery guidance."
+    },
+    {
+      "id": "positive-write-task",
+      "prompt": "Use $grok-delegate to fix the failing fixture, then inspect the diff and run its focused test.",
+      "setup": "Use a disposable Git repository with a known failing fixture and a ready Grok CLI.",
+      "expectedBehavior": "Uses write mode only because implementation is explicit; Codex verifies the resulting changes.",
+      "expectedResult": "Reports the result, diff, and test outcome without claiming success for a non-success stop reason."
+    }
+  ],
+  "negativeTests": [
+    {
+      "id": "negative-unsupported-surface",
+      "prompt": "Run Grok Companion in this ordinary ChatGPT mobile conversation.",
+      "setup": "Invoke outside a supported local Codex surface.",
+      "expectedBehavior": "Does not pretend the local executable is available and explains the supported Codex surfaces.",
+      "expectedResult": "No Grok process or model request is started."
+    },
+    {
+      "id": "negative-missing-auth",
+      "prompt": "Use $grok-setup even though Grok is not logged in.",
+      "setup": "Use a compatible Grok CLI with no non-empty credential evidence.",
+      "expectedBehavior": "Performs only the offline readiness check and fails closed on authentication readiness.",
+      "expectedResult": "Reports ready=false and gives login guidance without printing secret values."
+    },
+    {
+      "id": "negative-active-export",
+      "prompt": "Export the full record of my currently running Grok job.",
+      "setup": "Start a background job that remains queued or running.",
+      "expectedBehavior": "Rejects result --out while the request is still needed by the detached worker.",
+      "expectedResult": "Returns a nonzero error and creates no export containing the active request."
+    }
+  ]
+}

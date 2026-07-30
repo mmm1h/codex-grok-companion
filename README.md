@@ -1,8 +1,10 @@
 # Grok Companion for Codex
 
 Use the local Grok CLI from Codex for structured code reviews, delegated coding
-tasks, and tracked background jobs. One Codex plugin works in both Codex CLI and
-Codex in the ChatGPT desktop app.
+tasks, and tracked background jobs. One Codex-targeted plugin works in both
+Codex CLI and Codex in the ChatGPT desktop app. The plugin can be submitted to
+OpenAI's shared Plugins Directory, but its local-runtime requirement means it
+is not a general ChatGPT connector.
 
 This is the Codex-host counterpart to
 [claude-plugin-grok](https://github.com/mmm1h/claude-plugin-grok). It is not the
@@ -91,15 +93,28 @@ $grok-jobs show recent jobs
   `GROK_COMPANION_HOME` takes precedence over both. `$grok-setup` reports the
   effective directory and selector.
 - Export a job explicitly with `result <job-id> --out <path>`. Exports contain
-  the terminal job record, logs, and model output. Prompt-bearing rerun
-  sidecars are not retained; job records still retain the shortened prompt
-  summary shown in status output.
+  the terminal job record, logs, and model output. Active jobs cannot be
+  exported because their request is still needed by the detached worker.
+  Prompt-bearing requests are removed from terminal records; those records
+  retain the shortened prompt summary shown in status output. Logs and model
+  results can still contain task text, diffs, repository content, or tool
+  output and should be handled as potentially sensitive.
+- Grok must finish with a successful stop reason. Cancellation, refusal,
+  length limits, or any other non-success stop reason fails the command even
+  when the Grok process itself exits with code zero.
 
 ## Data And Permissions
 
 This plugin launches the user's local `grok` binary. Review evidence, task
 prompts, and any files Grok reads are handled by the Grok CLI and the provider
 configured by the user. The plugin does not collect telemetry or copy API keys.
+
+Tracked job state is stored locally until explicit cleanup or automatic
+pruning. The index retains at most 50 jobs and prunes only the oldest terminal
+job artifacts; it never prunes active work. See the full
+[Privacy Policy](plugins/grok-companion/PRIVACY.md),
+[Terms of Service](plugins/grok-companion/TERMS.md), and
+[Support Guide](plugins/grok-companion/SUPPORT.md).
 
 Codex sandbox and approval policy governs the companion command. Grok then
 applies its own sandbox and permission mode. Read-only runs use plan mode and a
@@ -136,6 +151,8 @@ explicit `--write`. Piped input is read only with `--stdin`.
 ```text
 npm install
 npm test
+npm run test:store
+npm run package:plugin
 ```
 
 Tests use a fake Grok executable and do not require authentication or model
@@ -145,6 +162,11 @@ usage. Validate the plugin and skills before publishing:
 python <plugin-creator>/scripts/validate_plugin.py plugins/grok-companion
 python <skill-creator>/scripts/quick_validate.py plugins/grok-companion/skills/grok-setup
 ```
+
+`npm run package:plugin` creates a deterministic skills-only ZIP under
+`dist/`. Store submission metadata, including five positive and three negative
+review cases, lives in
+[`plugins/grok-companion/store/submission.json`](plugins/grok-companion/store/submission.json).
 
 ## Attribution
 

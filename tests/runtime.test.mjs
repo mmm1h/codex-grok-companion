@@ -93,7 +93,7 @@ test("review CLI fails closed when Grok returns invalid structured output", (t) 
   const payload = JSON.parse(response.stdout);
   assert.equal(payload.exitCode, 1);
   assert.equal(payload.result, null);
-  assert.match(payload.parseError, /JSON/);
+  assert.match(payload.parseError, /JSON|terminal stop reason/);
   assert.equal(payload.rawOutput, "not-json");
 });
 
@@ -318,6 +318,36 @@ test("task defaults to read-only and explicit write uses acceptEdits", (t) => {
   assert.ok(writeArgs.includes("acceptEdits"));
   assert.ok(!writeArgs.includes("--always-approve"));
   assert.ok(!writeArgs.includes("bypassPermissions"));
+});
+
+test("task fails closed when Grok ends with a cancelled stop reason", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const stream = [
+    JSON.stringify({ type: "text", data: "incomplete progress" }),
+    JSON.stringify({
+      type: "end",
+      stopReason: "Cancelled",
+      sessionId: "77777777-7777-4777-8777-777777777777"
+    })
+  ].join("\n");
+  const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_STREAM: stream });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const result = runCompanion(["task", "--json", "--cwd", repo, "cancelled upstream"], { env, cwd: repo });
+  assert.equal(result.status, 1, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.exitCode, 1);
+  assert.equal(payload.stopReason, "Cancelled");
+  assert.equal(payload.rawOutput, "incomplete progress");
+
+  const status = runCompanion(["status", "--all", "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(status.status, 0, status.stderr);
+  const stored = JSON.parse(status.stdout).jobs[0];
+  assert.equal(stored.status, "failed");
+  assert.match(stored.errorMessage, /stop reason: Cancelled/);
 });
 
 test("single positional task prompts preserve quotes, apostrophes, and spacing", (t) => {
@@ -789,6 +819,7 @@ test("cleanup dry-run and result --out preserve job evidence", (t) => {
   assert.equal(fs.existsSync(outPath), true);
   const bundle = JSON.parse(fs.readFileSync(outPath, "utf8"));
   assert.equal(bundle.job.id, jobId);
+  assert.equal(bundle.job.request, undefined);
   assert.equal(bundle.rerun, undefined);
   assert.ok(typeof bundle.log === "string");
 
@@ -802,6 +833,30 @@ test("cleanup dry-run and result --out preserve job evidence", (t) => {
   const cleaned = runCompanion(["cleanup", "--keep", "0", "--json", "--cwd", repo], { env, cwd: repo });
   assert.equal(cleaned.status, 0, cleaned.stderr);
   assert.equal(fs.existsSync(resolveJobFile(repo, jobId)), false);
+});
+
+test("result --out rejects active jobs and never exports their prompt", async (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const prompt = "ACTIVE_PROMPT_MUST_NOT_EXPORT";
+  const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_DELAY_MS: "30000" });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const launched = runCompanion(["task", "--background", "--json", "--cwd", repo, prompt], { env, cwd: repo });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+  await waitForJob(repo, env, jobId, (job) => job.status === "running", 20_000);
+
+  const outPath = path.join(root, "active-bundle.json");
+  const exported = runCompanion(["result", jobId, "--out", outPath, "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(exported.status, 1);
+  assert.match(exported.stderr, /still running/i);
+  assert.equal(fs.existsSync(outPath), false);
+
+  const cancelled = runCompanion(["cancel", jobId, "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
 });
 
 test("status filters by kind/status/limit and cancel --all cancels active jobs", async (t) => {

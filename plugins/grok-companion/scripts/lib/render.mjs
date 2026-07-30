@@ -224,6 +224,7 @@ export function renderTaskResult(payload, options = {}) {
     `${options.title ?? "Grok Task"} ${payload.exitCode === 0 ? "completed" : "failed"}.`,
     payload.sessionId ? `Grok session ID: ${payload.sessionId}` : null,
     canResume ? `Continue with $grok-delegate --session-id ${payload.sessionId}.` : null,
+    payload.stopReason ? `Grok stop reason: ${payload.stopReason}` : null,
     "",
     String(payload.rawOutput || payload.stderr || "Grok returned no output.").trimEnd()
   ].filter((value) => value !== null);

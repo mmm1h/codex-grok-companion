@@ -467,6 +467,11 @@ test("loadState with corrupt JSON does not prune existing job files", (t) => {
     title: "Keep me",
     status: "running",
     phase: "tool",
+    pid: 4242,
+    processName: "node",
+    processStartedAtMs: 42_420,
+    workerLaunchStartedAt: "2026-07-29T10:00:00.000Z",
+    workerSpawnedAt: "2026-07-29T10:00:01.000Z",
     cwd: root,
     workspaceRoot: root,
     summary: "important",
@@ -484,6 +489,11 @@ test("loadState with corrupt JSON does not prune existing job files", (t) => {
   assert.equal(fs.existsSync(jobFile), true);
   assert.equal(fs.existsSync(logPath), true);
   assert.equal(recovered.jobs.some((job) => job.id === jobId), true);
+  const recoveredJob = recovered.jobs.find((job) => job.id === jobId);
+  assert.equal(recoveredJob.processName, "node");
+  assert.equal(recoveredJob.processStartedAtMs, 42_420);
+  assert.equal(recoveredJob.workerLaunchStartedAt, "2026-07-29T10:00:00.000Z");
+  assert.equal(recoveredJob.workerSpawnedAt, "2026-07-29T10:00:01.000Z");
 
   // A subsequent index write must not wipe the real job after a corrupt read path.
   upsertJob(root, { id: "task-new-after-corrupt", status: "queued" });
