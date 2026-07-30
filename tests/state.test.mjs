@@ -28,6 +28,7 @@ import {
   createJobLogFile,
   createJobProgressUpdater,
   createJobRecord,
+  publishDetachedWorkerPid,
   runTrackedJob
 } from "../plugins/grok-companion/scripts/lib/tracked-jobs.mjs";
 import {
@@ -671,4 +672,38 @@ test("updateJobFile mutator can skip when status is no longer active", (t) => {
   }));
   assert.equal(result.status, "completed");
   assert.equal(readJobFile(resolveJobFile(root, jobId)).status, "completed");
+});
+
+test("launcher publishes PID after the worker has already entered running", (t) => {
+  const { root } = withCompanionHome(t);
+  const jobId = "task-pid-publication-race";
+  const job = {
+    id: jobId,
+    kind: "task",
+    title: "PID race",
+    status: "running",
+    phase: "starting",
+    pid: null,
+    cwd: root,
+    workspaceRoot: root,
+    summary: "worker won the status race",
+    createdAt: new Date().toISOString()
+  };
+  writeJobFile(root, jobId, job);
+  upsertJob(root, job);
+
+  publishDetachedWorkerPid(root, jobId, 4242, {
+    name: "node",
+    startedAtMs: 42_420
+  });
+  const stored = readJobFile(resolveJobFile(root, jobId));
+  assert.equal(stored.status, "running");
+  assert.equal(stored.pid, 4242);
+  assert.equal(stored.processName, "node");
+  assert.equal(stored.processStartedAtMs, 42_420);
+  assert.ok(stored.workerSpawnedAt);
+  assert.equal(listJobs(root).find((entry) => entry.id === jobId)?.pid, 4242);
+
+  publishDetachedWorkerPid(root, jobId, 9999, { name: "other", startedAtMs: 99_990 });
+  assert.equal(readJobFile(resolveJobFile(root, jobId)).pid, 4242);
 });

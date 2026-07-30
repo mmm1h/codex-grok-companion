@@ -433,8 +433,7 @@ function saveStateUnlocked(cwd, state) {
     prunedIds.push(job.id);
     for (const target of [
       path.join(resolveJobsDir(cwd), `${job.id}.json`),
-      job.logPath || path.join(resolveJobsDir(cwd), `${job.id}.log`),
-      path.join(resolveJobsDir(cwd), `${job.id}.rerun.json`)
+      job.logPath || path.join(resolveJobsDir(cwd), `${job.id}.log`)
     ]) {
       try {
         if (fs.existsSync(target)) {
@@ -506,41 +505,6 @@ export function resolveJobFile(cwd, jobId) {
 export function resolveJobLogFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);
-}
-
-/**
- * Sidecar path for rerun payloads. Terminal job records drop `request`
- * (tracked-jobs strips it); this file keeps a minimal copy for rerun.
- */
-export function resolveJobRerunFile(cwd, jobId) {
-  ensureStateDir(cwd);
-  return path.join(resolveJobsDir(cwd), `${jobId}.rerun.json`);
-}
-
-export function writeJobRerunPayload(cwd, jobId, payload) {
-  ensureStateDir(cwd);
-  const file = resolveJobRerunFile(cwd, jobId);
-  writeJsonFileAtomic(file, {
-    version: 1,
-    jobId,
-    savedAt: nowIso(),
-    ...payload
-  });
-  return file;
-}
-
-export function readJobRerunPayload(cwd, jobId) {
-  const file = resolveJobRerunFile(cwd, jobId);
-  if (!fs.existsSync(file)) {
-    return null;
-  }
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`[grok] Failed to parse rerun payload ${file}: ${message}\n`);
-    return null;
-  }
 }
 
 /**

@@ -358,51 +358,28 @@ test("background task can be cancelled and remains cancelled", async (t) => {
   assert.ok(job.terminationMethod);
 });
 
-test("resume candidates are workspace-scoped and active tasks block resume", async (t) => {
+test("task rejects implicit resume flags and starts fresh by default", (t) => {
   const root = tempDir();
   const repo = path.join(root, "repo");
   const state = path.join(root, "state");
   fs.mkdirSync(repo);
   initRepo(repo);
-  const envA = fakeGrokEnv(state);
-  const envB = fakeGrokEnv(state);
+  const env = fakeGrokEnv(state);
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
-  const first = runCompanion(["task", "--json", "--cwd", repo, "first session task"], { env: envA, cwd: repo });
+  const first = runCompanion(["task", "--json", "--cwd", repo, "first session task"], { env, cwd: repo });
   assert.equal(first.status, 0, first.stderr);
   const firstSessionId = JSON.parse(first.stdout).sessionId;
-  const candidateA = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env: envA, cwd: repo });
-  const candidatePayload = JSON.parse(candidateA.stdout);
-  assert.equal(candidatePayload.sessionId, firstSessionId);
-  assert.equal(candidatePayload.status, "completed");
-  assert.equal(candidatePayload.summary, "first session task");
-  assert.ok(candidatePayload.updatedAt);
-  assert.equal(candidatePayload.sessionConfirmed, true);
-  assert.equal(candidatePayload.resumable, true);
-  const candidateB = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env: envB, cwd: repo });
-  assert.equal(JSON.parse(candidateB.stdout).available, true);
-  assert.equal(JSON.parse(candidateB.stdout).sessionId, firstSessionId);
 
-  const resumeCapture = path.join(root, "resume-capture.json");
-  const resumed = runCompanion(["task", "--resume", "--json", "--cwd", repo, "continue scoped session"], {
-    env: { ...envA, FAKE_GROK_CAPTURE: resumeCapture },
-    cwd: repo
-  });
-  assert.equal(resumed.status, 0, resumed.stderr);
-  assert.equal(JSON.parse(fs.readFileSync(resumeCapture, "utf8")).resumeSessionId, firstSessionId);
-
-  const delayedEnvA = { ...envA, FAKE_GROK_DELAY_MS: "10000" };
-  const active = runCompanion(["task", "--background", "--json", "--fresh", "--cwd", repo, "active task"], { env: delayedEnvA, cwd: repo });
-  const activeId = JSON.parse(active.stdout).jobId;
-  await waitForJob(repo, delayedEnvA, activeId, (job) => job.status === "running");
-  const blocked = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env: delayedEnvA, cwd: repo });
-  assert.equal(blocked.status, 1);
-  assert.match(blocked.stderr, /Cannot resume while Grok task/);
-  runCompanion(["cancel", activeId, "--json", "--cwd", repo], { env: delayedEnvA, cwd: repo });
+  for (const flag of ["--resume", "--resume=false", "--resume-last", "--resume-last=false"]) {
+    const rejected = runCompanion(["task", flag, "--json", "--cwd", repo, "implicit continuation"], { env, cwd: repo });
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /Implicit resume was removed/);
+  }
 
   const capture = path.join(root, "fresh-capture.json");
-  const fresh = runCompanion(["task", "--fresh", "--json", "--cwd", repo, "explicitly fresh"], {
-    env: { ...envA, FAKE_GROK_CAPTURE: capture },
+  const fresh = runCompanion(["task", "--json", "--cwd", repo, "fresh by default"], {
+    env: { ...env, FAKE_GROK_CAPTURE: capture },
     cwd: repo
   });
   assert.equal(fresh.status, 0, fresh.stderr);
@@ -411,7 +388,7 @@ test("resume candidates are workspace-scoped and active tasks block resume", asy
   assert.equal(captured.resumeSessionId, null);
 });
 
-test("failed-before-session jobs are not resume candidates", (t) => {
+test("explicit resume rejects a job without a confirmed session", (t) => {
   const root = tempDir();
   const repo = path.join(root, "repo");
   const state = path.join(root, "state");
@@ -429,8 +406,12 @@ test("failed-before-session jobs are not resume candidates", (t) => {
   assert.ok(failedJob.sessionId, "the preallocated candidate UUID remains observable");
   assert.equal(failedJob.sessionConfirmed, false);
   assert.equal(failedJob.resumable, false);
-  const failedCandidate = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env: failedEnv, cwd: repo });
-  assert.equal(JSON.parse(failedCandidate.stdout).available, false);
+  const resume = runCompanion(
+    ["task", "--resume-job", failedJob.id, "--json", "--cwd", repo, "try explicit continuation"],
+    { env: failedEnv, cwd: repo }
+  );
+  assert.equal(resume.status, 1);
+  assert.match(resume.stderr, /no confirmed Grok session/i);
 });
 
 test("status persists a dead worker as failed process-exited and result becomes readable", async (t) => {
@@ -456,7 +437,7 @@ test("status persists a dead worker as failed process-exited and result becomes 
   assert.equal(JSON.parse(result.stdout).status, "failed");
 });
 
-test("task and task-resume-candidate reclaim dead-PID orphans before findLatestTaskSession", async (t) => {
+test("explicit resume reclaims a dead-PID orphan before resolving its job", async (t) => {
   const root = tempDir();
   const repo = path.join(root, "repo");
   const state = path.join(root, "state");
@@ -473,43 +454,28 @@ test("task and task-resume-candidate reclaim dead-PID orphans before findLatestT
   });
   assert.equal(launched.status, 0, launched.stderr);
   const jobId = JSON.parse(launched.stdout).jobId;
-  const running = await waitForJob(repo, env, jobId, (job) => job.status === "running" && job.pid);
+  const running = await waitForJob(
+    repo,
+    env,
+    jobId,
+    (job) => job.status === "running" && job.pid && job.sessionConfirmed === true
+  );
   const termination = terminateProcessTree(running.pid, { cwd: repo, env });
   assert.equal(termination.delivered, true);
   await new Promise((resolve) => setTimeout(resolve, 300));
 
-  // Without status/result the index would still say running; resume paths must reconcile first
-  // so they do not permanently throw "Cannot resume while ... is running".
-  const candidate = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env, cwd: repo });
-  assert.equal(candidate.status, 0, candidate.stderr);
-  assert.doesNotMatch(candidate.stderr, /Cannot resume while Grok task/);
-  const candidatePayload = JSON.parse(candidate.stdout);
-  // Reconcile flips the orphan to failed. Whether it is resumable depends on whether
-  // sessionConfirmed landed before the kill (race with FAKE_GROK_DELAY_MS).
-  if (candidatePayload.available) {
-    assert.equal(candidatePayload.jobId, jobId);
-    assert.equal(candidatePayload.status, "failed");
-  }
+  const resumeCapture = path.join(root, "resume-after-orphan.json");
+  const resume = runCompanion(["task", "--resume-job", jobId, "--json", "--cwd", repo, "after orphan reclaim"], {
+    env: { ...env, FAKE_GROK_CAPTURE: resumeCapture, FAKE_GROK_DELAY_MS: "0" },
+    cwd: repo
+  });
+  assert.equal(resume.status, 0, resume.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(resumeCapture, "utf8")).resumeSessionId, running.sessionId);
 
   const status = runCompanion(["status", jobId, "--json", "--cwd", repo], { env, cwd: repo });
   const failedJob = JSON.parse(status.stdout).job;
   assert.equal(failedJob.status, "failed");
   assert.equal(failedJob.phase, "process-exited");
-
-  // task --resume must reconcile too (not block on the stale running index entry).
-  const resumeCapture = path.join(root, "resume-after-orphan.json");
-  const resume = runCompanion(["task", "--resume", "--json", "--cwd", repo, "after orphan reclaim"], {
-    env: { ...env, FAKE_GROK_CAPTURE: resumeCapture, FAKE_GROK_DELAY_MS: "0" },
-    cwd: repo
-  });
-  assert.doesNotMatch(resume.stderr, /Cannot resume while Grok task/);
-  if (candidatePayload.available) {
-    assert.equal(resume.status, 0, resume.stderr);
-    assert.equal(JSON.parse(fs.readFileSync(resumeCapture, "utf8")).resumeSessionId, failedJob.sessionId);
-  } else {
-    assert.equal(resume.status, 1, resume.stderr);
-    assert.match(resume.stderr, /No resumable Grok task session/);
-  }
 });
 
 test("job-worker refuses to re-run completed or cancelled jobs", (t) => {
@@ -607,7 +573,7 @@ test("task rejects oversized --prompt-file before invoking Grok", (t) => {
   assert.equal(fs.existsSync(capture), false);
 });
 
-test("task --resume without prompt injects the default continue prompt", (t) => {
+test("task --session-id without prompt injects the default continue prompt", (t) => {
   const root = tempDir();
   const repo = path.join(root, "repo");
   const state = path.join(root, "state");
@@ -620,7 +586,7 @@ test("task --resume without prompt injects the default continue prompt", (t) => 
   assert.equal(first.status, 0, first.stderr);
   const sessionId = JSON.parse(first.stdout).sessionId;
   const capture = path.join(root, "continue-capture.json");
-  const resumed = runCompanion(["task", "--resume", "--json", "--cwd", repo], {
+  const resumed = runCompanion(["task", "--session-id", sessionId, "--json", "--cwd", repo], {
     env: { ...env, FAKE_GROK_CAPTURE: capture },
     cwd: repo
   });
@@ -645,10 +611,6 @@ test("task --session-id and --resume-job resume a confirmed workspace session", 
   const sessionId = JSON.parse(first.stdout).sessionId;
   const status = runCompanion(["status", "--all", "--json", "--cwd", repo], { env: envA, cwd: repo });
   const jobId = JSON.parse(status.stdout).jobs[0].id;
-
-  // Any Codex chat in the same workspace sees the confirmed resume candidate.
-  const candidateB = runCompanion(["task-resume-candidate", "--json", "--cwd", repo], { env: envB, cwd: repo });
-  assert.equal(JSON.parse(candidateB.stdout).available, true);
 
   const bySession = path.join(root, "by-session.json");
   const resumedBySession = runCompanion(
@@ -724,7 +686,7 @@ test("review accepts --timeout-ms and adversarial review loads focus from a file
   assert.match(invalid.stderr, /timeout-ms must be a positive number/i);
 });
 
-test("rerun requeues a finished job from the request sidecar", (t) => {
+test("terminal jobs do not retain prompt-bearing rerun sidecars", (t) => {
   const root = tempDir();
   const repo = path.join(root, "repo");
   const state = path.join(root, "state");
@@ -740,24 +702,18 @@ test("rerun requeues a finished job from the request sidecar", (t) => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  const first = runCompanion(["task", "--json", "--cwd", repo, "original prompt for rerun"], { env, cwd: repo });
+  const prompt = "sensitive prompt that must not survive in a rerun sidecar";
+  const first = runCompanion(["task", "--json", "--cwd", repo, prompt], { env, cwd: repo });
   assert.equal(first.status, 0, first.stderr);
   const status = runCompanion(["status", "--all", "--json", "--cwd", repo], { env, cwd: repo });
   const sourceId = JSON.parse(status.stdout).jobs[0].id;
   const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, sourceId), "utf8"));
   assert.equal(stored.request, undefined);
-
-  const capture = path.join(root, "rerun-capture.json");
-  const rerun = runCompanion(["rerun", sourceId, "--json", "--cwd", repo], {
-    env: { ...env, FAKE_GROK_CAPTURE: capture },
-    cwd: repo
-  });
-  assert.equal(rerun.status, 0, rerun.stderr);
-  const captured = JSON.parse(fs.readFileSync(capture, "utf8"));
-  assert.match(captured.prompt, /original prompt for rerun/);
+  const sidecar = path.join(path.dirname(resolveJobFile(repo, sourceId)), `${sourceId}.rerun.json`);
+  assert.equal(fs.existsSync(sidecar), false);
 });
 
-test("logs and status --progress-lines expose job log content", async (t) => {
+test("status --logs and --progress-lines expose job log content", async (t) => {
   const root = tempDir();
   const repo = path.join(root, "repo");
   fs.mkdirSync(repo);
@@ -773,12 +729,24 @@ test("logs and status --progress-lines expose job log content", async (t) => {
   const jobId = JSON.parse(launched.stdout).jobId;
   await waitForJob(repo, env, jobId, (job) => job.status === "running" && job.sessionConfirmed === true);
 
-  const logs = runCompanion(["logs", jobId, "--tail", "20", "--json", "--cwd", repo], { env, cwd: repo });
+  const logs = runCompanion(["status", jobId, "--logs", "20", "--json", "--cwd", repo], { env, cwd: repo });
   assert.equal(logs.status, 0, logs.stderr);
   const logPayload = JSON.parse(logs.stdout);
   assert.equal(logPayload.jobId, jobId);
   assert.equal(logPayload.exists, true);
   assert.ok(logPayload.lines.length > 0);
+
+  const defaultLogs = runCompanion(["status", jobId, "--logs", "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(defaultLogs.status, 0, defaultLogs.stderr);
+  assert.equal(JSON.parse(defaultLogs.stdout).tail, 80);
+
+  const logsBeforeId = runCompanion(["status", "--logs", jobId, "--json", "--cwd", repo], { env, cwd: repo });
+  assert.equal(logsBeforeId.status, 0, logsBeforeId.stderr);
+  assert.equal(JSON.parse(logsBeforeId.stdout).jobId, jobId);
+
+  const incompatible = runCompanion(["status", jobId, "--logs", "--all", "--cwd", repo], { env, cwd: repo });
+  assert.equal(incompatible.status, 1);
+  assert.match(incompatible.stderr, /cannot be combined with list filters/i);
 
   const status = runCompanion(
     ["status", jobId, "--progress-lines", "10", "--json", "--cwd", repo],
@@ -791,7 +759,7 @@ test("logs and status --progress-lines expose job log content", async (t) => {
   runCompanion(["cancel", jobId, "--json", "--cwd", repo], { env, cwd: repo });
 });
 
-test("cleanup dry-run and export preserve job evidence", (t) => {
+test("cleanup dry-run and result --out preserve job evidence", (t) => {
   const root = tempDir();
   const repo = path.join(root, "repo");
   const state = path.join(root, "state");
@@ -813,21 +781,16 @@ test("cleanup dry-run and export preserve job evidence", (t) => {
   const jobId = JSON.parse(status.stdout).jobs[0].id;
 
   const outPath = path.join(root, "bundle.json");
-  const exported = runCompanion(["export", jobId, "--out", outPath, "--json", "--cwd", repo], { env, cwd: repo });
+  const exported = runCompanion(["result", jobId, "--out", outPath, "--json", "--cwd", repo], { env, cwd: repo });
   assert.equal(exported.status, 0, exported.stderr);
   const exportPayload = JSON.parse(exported.stdout);
   assert.equal(exportPayload.jobId, jobId);
-  assert.equal(exportPayload.hasRerun, true);
+  assert.equal(exportPayload.hasRerun, undefined);
   assert.equal(fs.existsSync(outPath), true);
   const bundle = JSON.parse(fs.readFileSync(outPath, "utf8"));
   assert.equal(bundle.job.id, jobId);
-  assert.ok(bundle.rerun?.request?.prompt);
-
-  const defaultExport = runCompanion(["export", jobId, "--json", "--cwd", repo], { env, cwd: repo });
-  assert.equal(defaultExport.status, 0, defaultExport.stderr);
-  const defaultPath = JSON.parse(defaultExport.stdout).outPath;
-  assert.equal(defaultPath.startsWith(repo), false);
-  assert.equal(fs.existsSync(defaultPath), true);
+  assert.equal(bundle.rerun, undefined);
+  assert.ok(typeof bundle.log === "string");
 
   const dry = runCompanion(["cleanup", "--keep", "0", "--dry-run", "--json", "--cwd", repo], { env, cwd: repo });
   assert.equal(dry.status, 0, dry.stderr);
@@ -905,7 +868,7 @@ test("status --wait --with-result returns the finished job result", async (t) =>
   assert.match(payload.result.result.rawOutput, /FAKE_GROK_OK/);
 });
 
-test("usage lists new commands and task resume flags", (t) => {
+test("usage lists consolidated lifecycle commands and explicit resume flags", (t) => {
   const response = runCompanion(["help"], { env: fakeGrokEnv(tempDir()), cwd: process.cwd() });
   assert.equal(response.status, 0, response.stderr);
   assert.match(response.stdout, /--session-id/);
@@ -914,10 +877,14 @@ test("usage lists new commands and task resume flags", (t) => {
   assert.match(response.stdout, /--timeout-ms/);
   assert.match(response.stdout, /--inline-diff-max-files/);
   assert.match(response.stdout, /--inline-diff-max-bytes/);
-  assert.match(response.stdout, /\blogs\b/);
+  assert.match(response.stdout, /--logs/);
   assert.match(response.stdout, /\bcleanup\b/);
-  assert.match(response.stdout, /\bexport\b/);
-  assert.match(response.stdout, /\brerun\b/);
+  assert.match(response.stdout, /--out/);
+  assert.doesNotMatch(response.stdout, /grok-companion\.mjs logs\b/);
+  assert.doesNotMatch(response.stdout, /grok-companion\.mjs export\b/);
+  assert.doesNotMatch(response.stdout, /\brerun\b/);
+  assert.doesNotMatch(response.stdout, /--resume-last/);
+  assert.doesNotMatch(response.stdout, /\|--resume(?:\||\])/);
   assert.match(response.stdout, /--with-result/);
   assert.match(response.stdout, /cancel .*--all/);
 });

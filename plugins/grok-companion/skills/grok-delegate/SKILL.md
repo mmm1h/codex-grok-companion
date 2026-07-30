@@ -23,9 +23,11 @@ request that forbids edits. Use `--write` only when the user's request already
 authorizes implementation or file changes. Do not broaden that authority. If
 neither flag is supplied, the runtime defaults to read-only.
 
-Use `--fresh` for an independent task. Use `--resume-last`, `--resume-job
-<job-id>`, or `--session-id <id>` only when the user asks to continue relevant
-prior Grok work. Forward model, effort, and timeout choices only when specified.
+Tasks are fresh by default; `--fresh` may be used to make that intent explicit.
+Continue prior Grok work only with an explicit `--resume-job <job-id>` or
+`--session-id <id>` supplied from a relevant job result. Never infer or select
+the latest session. Forward model, effort, and timeout choices only when
+specified.
 
 ## Choose Execution
 

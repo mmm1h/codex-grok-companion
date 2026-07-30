@@ -11,15 +11,11 @@ import {
 import {
   listJobs,
   readJobFile,
-  readJobRerunPayload,
   resolveJobFile,
   resolveJobLogFile,
-  resolveJobRerunFile,
-  resolveStateDir,
   updateState,
   upsertJob,
-  writeJobFile,
-  writeJobRerunPayload
+  writeJobFile
 } from "./state.mjs";
 import { appendLogLine, indexJobRecord, nowIso } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -35,6 +31,20 @@ export const DEFAULT_LOG_TAIL_LINES = 80;
 /** Exit code when status/result --wait times out while the job is still active. */
 export const WAIT_TIMEOUT_EXIT_CODE = 124;
 export const PIDLESS_QUEUE_GRACE_MS = 15_000;
+/** Bounded backoff while a detached worker publishes its PID or finishes starting. */
+export const CANCEL_TERMINATE_RETRY_DELAYS_MS = [25, 50, 100, 200];
+
+const cancelRetryWaiter = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSyncMs(milliseconds) {
+  if (milliseconds > 0) {
+    Atomics.wait(cancelRetryWaiter, 0, 0, milliseconds);
+  }
+}
+
+function isValidPid(pid) {
+  return Number.isInteger(pid) && pid > 0;
+}
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -116,33 +126,11 @@ export function enrichJob(job, options = {}) {
   };
 }
 
-/**
- * Persist a minimal rerun sidecar so terminal jobs remain re-queueable even
- * though tracked-jobs strips `request` from the finished job record.
- */
-export function saveJobRerunSnapshot(workspaceRoot, job) {
-  if (!job?.id || !job?.request) {
-    return null;
-  }
-  return writeJobRerunPayload(workspaceRoot, job.id, {
-    kind: job.kind,
-    title: job.title,
-    summary: job.summary,
-    write: Boolean(job.write),
-    sessionId: job.sessionId ?? null,
-    sessionConfirmed: Boolean(job.sessionConfirmed),
-    request: job.request
-  });
-}
-
-export function loadJobRerunSnapshot(workspaceRoot, jobId) {
-  return readJobRerunPayload(workspaceRoot, jobId);
-}
-
 function persistJob(workspaceRoot, job) {
   writeJobFile(workspaceRoot, job.id, job);
-  upsertJob(workspaceRoot, indexJobRecord(job));
-  return job;
+  const persisted = readStoredJob(workspaceRoot, job.id) ?? job;
+  upsertJob(workspaceRoot, indexJobRecord(persisted));
+  return persisted;
 }
 
 function identityOptions(job, options = {}) {
@@ -202,6 +190,31 @@ export function reconcileOrphanedJob(workspaceRoot, job, options = {}) {
   }
   const message = `Tracked Grok process ${job.pid} exited before the job reached a terminal state.`;
   const { request: _request, ...base } = stored;
+  const cancelWasRequested = Boolean(
+    stored.cancelRequestedAt
+    || stored.phase === "cancel-requested"
+    || stored.phase === "cancel-failed"
+  );
+  if (cancelWasRequested) {
+    const cancelledAt = nowIso();
+    const cancelled = persistJob(workspaceRoot, {
+      ...base,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      completedAt: cancelledAt,
+      cancelledAt: stored.cancelledAt ?? cancelledAt,
+      cancelRequestedAt: stored.cancelRequestedAt ?? cancelledAt,
+      terminationMethod: stored.terminationMethod ?? "already-exited",
+      terminationDelivered: stored.terminationDelivered === true,
+      resumable: stored.kind === "task" && Boolean(stored.sessionConfirmed),
+      errorMessage: null
+    });
+    if (cancelled.status === "cancelled") {
+      appendLogLine(cancelled.logPath, `Cancelled after reconcile: tracked process ${job.pid} exited following a cancel request.`);
+    }
+    return cancelled;
+  }
   const failed = persistJob(workspaceRoot, {
     ...base,
     status: "failed",
@@ -226,9 +239,7 @@ export function reconcileJobs(workspaceRoot, options = {}) {
  * Reconcile jobs for the current workspace.
  *
  * Wire this at companion entry points that must not see stale "running" orphans:
- * - task (before findLatestTaskSession / enqueue)
- * - task-resume-candidate
- * - any other path that calls findLatestTaskSession
+ * - task (before explicit resume lookup / enqueue)
  *
  * status/result already reconcile via buildStatusSnapshot / resolveResultJob.
  */
@@ -281,30 +292,89 @@ export function cancelTrackedJob(workspaceRoot, job, options = {}) {
     };
   }
 
+  const alive = options.isProcessAliveImpl ?? isProcessAlive;
+  const terminate = options.terminateImpl ?? terminateProcessTree;
+  const sleep = options.sleepImpl ?? sleepSyncMs;
+  const retryDelays = options.retryDelaysMs ?? CANCEL_TERMINATE_RETRY_DELAYS_MS;
+  const maxAttempts = Math.max(1, retryDelays.length + 1);
+
   let termination = { attempted: false, delivered: false, method: null };
   let terminationError = null;
-  try {
-    termination = (options.terminateImpl ?? terminateProcessTree)(requested.pid, {
-      cwd: requested.cwd,
-      env: options.env,
-      ...identityOptions(requested, options)
-    });
-  } catch (error) {
-    terminationError = error instanceof Error ? error.message : String(error);
-  }
-  const alive = options.isProcessAliveImpl ?? isProcessAlive;
-  const exited = !alive(requested.pid, identityOptions(requested, options));
-  const cancelled = Boolean(termination.delivered || exited);
-  const missingPid = !Number.isInteger(requested.pid) || requested.pid <= 0;
-  const method = termination.method ?? (
-    exited
-      ? (missingPid ? "marked-before-worker-pid" : "already-exited")
-      : null
-  );
+  let lastPid = isValidPid(requested.pid) ? requested.pid : null;
+  let sawAlive = false;
+  let confirmedExit = false;
+  let latestSnapshot = requested;
 
-  if (cancelled) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    latestSnapshot = readStoredJob(workspaceRoot, job.id) ?? latestSnapshot;
+    if (latestSnapshot.status === "cancelled") {
+      return {
+        job: latestSnapshot,
+        previousStatus: stored.status,
+        status: "cancelled",
+        delivered: Boolean(latestSnapshot.terminationDelivered),
+        method: latestSnapshot.terminationMethod ?? null,
+        errorMessage: null
+      };
+    }
+    if (isValidPid(latestSnapshot.pid)) {
+      lastPid = latestSnapshot.pid;
+    }
+
+    if (!isValidPid(lastPid)) {
+      if (attempt < maxAttempts - 1) {
+        sleep(retryDelays[attempt] ?? retryDelays[retryDelays.length - 1] ?? 25);
+      }
+      continue;
+    }
+
+    const guard = identityOptions(latestSnapshot, options);
+    const currentlyAlive = alive(lastPid, guard);
+    if (currentlyAlive) {
+      sawAlive = true;
+    } else if (sawAlive) {
+      confirmedExit = true;
+      break;
+    }
+
+    try {
+      const result = terminate(lastPid, {
+        cwd: latestSnapshot.cwd ?? requested.cwd,
+        env: options.env,
+        ...guard
+      });
+      termination = {
+        attempted: true,
+        delivered: Boolean(result?.delivered),
+        method: result?.method ?? null
+      };
+    } catch (error) {
+      terminationError = error instanceof Error ? error.message : String(error);
+      termination = { attempted: true, delivered: false, method: termination.method ?? null };
+    }
+
+    if (termination.delivered) {
+      break;
+    }
+
+    if (!alive(lastPid, guard)) {
+      if (sawAlive) {
+        confirmedExit = true;
+        break;
+      }
+    } else {
+      sawAlive = true;
+    }
+
+    if (attempt < maxAttempts - 1) {
+      sleep(retryDelays[attempt] ?? retryDelays[retryDelays.length - 1] ?? 25);
+    }
+  }
+
+  if (termination.delivered || confirmedExit) {
     const cancelledAt = nowIso();
-    const { request: _request, ...base } = requested;
+    const method = termination.method ?? (confirmedExit ? "already-exited" : null);
+    const { request: _request, ...base } = latestSnapshot;
     const final = persistJob(workspaceRoot, {
       ...base,
       status: "cancelled",
@@ -312,25 +382,78 @@ export function cancelTrackedJob(workspaceRoot, job, options = {}) {
       pid: null,
       completedAt: cancelledAt,
       cancelledAt,
+      cancelRequestedAt: latestSnapshot.cancelRequestedAt ?? requested.cancelRequestedAt ?? cancelledAt,
       terminationMethod: method,
       terminationDelivered: Boolean(termination.delivered),
-      resumable: requested.kind === "task" && Boolean(requested.sessionConfirmed),
+      resumable: latestSnapshot.kind === "task" && Boolean(latestSnapshot.sessionConfirmed),
       errorMessage: null
     });
+    if (final.status !== "cancelled") {
+      return {
+        job: final,
+        previousStatus: stored.status,
+        status: final.status,
+        delivered: Boolean(termination.delivered),
+        method: termination.method ?? null,
+        errorMessage: final.errorMessage ?? null
+      };
+    }
     appendLogLine(final.logPath, `Cancelled via ${method ?? "confirmed process exit"}; signal delivered: ${Boolean(termination.delivered)}.`);
     return { job: final, previousStatus: stored.status, status: "cancelled", delivered: Boolean(termination.delivered), method, errorMessage: null };
   }
 
-  const errorMessage = terminationError || `Could not terminate process ${requested.pid}; it is still running.`;
-  const failed = persistJob(workspaceRoot, {
-    ...requested,
-    phase: "cancel-failed",
+  latestSnapshot = readStoredJob(workspaceRoot, job.id) ?? latestSnapshot;
+  if (isValidPid(latestSnapshot.pid)) {
+    lastPid = latestSnapshot.pid;
+  }
+
+  if (!isValidPid(lastPid)) {
+    const pendingMessage = "Worker PID not available yet; left cancel-requested for later reclaim.";
+    const pending = persistJob(workspaceRoot, {
+      ...latestSnapshot,
+      phase: "cancel-requested",
+      terminationMethod: null,
+      terminationDelivered: null,
+      errorMessage: pendingMessage
+    });
+    if (!["queued", "running"].includes(pending.status)) {
+      return { job: pending, previousStatus: stored.status, status: pending.status, delivered: false, method: null, errorMessage: pending.errorMessage ?? null };
+    }
+    appendLogLine(pending.logPath, `Cancellation pending: ${pendingMessage}`);
+    return { job: pending, previousStatus: stored.status, status: "cancel-requested", delivered: false, method: null, errorMessage: pendingMessage };
+  }
+
+  if (alive(lastPid, identityOptions(latestSnapshot, options))) {
+    const errorMessage = terminationError || `Could not terminate process ${lastPid}; it is still running.`;
+    const failed = persistJob(workspaceRoot, {
+      ...latestSnapshot,
+      phase: "cancel-failed",
+      pid: lastPid,
+      terminationMethod: termination.method ?? null,
+      terminationDelivered: false,
+      errorMessage
+    });
+    if (!["queued", "running"].includes(failed.status)) {
+      return { job: failed, previousStatus: stored.status, status: failed.status, delivered: false, method: termination.method ?? null, errorMessage: failed.errorMessage ?? null };
+    }
+    appendLogLine(failed.logPath, `Cancellation failed: ${errorMessage}`);
+    return { job: failed, previousStatus: stored.status, status: "cancel-failed", delivered: false, method: termination.method ?? null, errorMessage };
+  }
+
+  const uncertainMessage = `Could not confirm process ${lastPid} during cancel; left cancel-requested for later reclaim.`;
+  const uncertain = persistJob(workspaceRoot, {
+    ...latestSnapshot,
+    phase: "cancel-requested",
+    pid: lastPid,
     terminationMethod: termination.method ?? null,
     terminationDelivered: false,
-    errorMessage
+    errorMessage: uncertainMessage
   });
-  appendLogLine(failed.logPath, `Cancellation failed: ${errorMessage}`);
-  return { job: failed, previousStatus: stored.status, status: "cancel-failed", delivered: false, method: termination.method ?? null, errorMessage };
+  if (!["queued", "running"].includes(uncertain.status)) {
+    return { job: uncertain, previousStatus: stored.status, status: uncertain.status, delivered: false, method: termination.method ?? null, errorMessage: uncertain.errorMessage ?? null };
+  }
+  appendLogLine(uncertain.logPath, `Cancellation pending: ${uncertainMessage}`);
+  return { job: uncertain, previousStatus: stored.status, status: "cancel-requested", delivered: false, method: termination.method ?? null, errorMessage: uncertainMessage };
 }
 
 function budgetExhaustedResult(workspaceRoot, job, message) {
@@ -666,13 +789,11 @@ export function cleanupJobs(cwd, options = {}) {
   for (const job of selected) {
     const paths = {
       jobFile: resolveJobFile(workspaceRoot, job.id),
-      logFile: job.logPath || resolveJobLogFile(workspaceRoot, job.id),
-      rerunFile: resolveJobRerunFile(workspaceRoot, job.id)
+      logFile: job.logPath || resolveJobLogFile(workspaceRoot, job.id)
     };
     if (!dryRun) {
       unlinkIfExists(paths.jobFile);
       unlinkIfExists(paths.logFile);
-      unlinkIfExists(paths.rerunFile);
     }
     removed.push({
       id: job.id,
@@ -700,10 +821,11 @@ export function cleanupJobs(cwd, options = {}) {
   };
 }
 
-/**
- * Bundle a finished (or any) job into a portable export directory / archive payload.
- */
+/** Bundle a job and its log into a portable JSON payload. */
 export function exportJobBundle(cwd, reference, options = {}) {
+  if (!options.out) {
+    throw new Error("Export requires an explicit output path.");
+  }
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reconciledJobs(workspaceRoot));
   const selected = matchReference(jobs, reference);
@@ -712,30 +834,18 @@ export function exportJobBundle(cwd, reference, options = {}) {
   }
   const stored = readStoredJob(workspaceRoot, selected.id) ?? selected;
   const logPath = stored.logPath || resolveJobLogFile(workspaceRoot, selected.id);
-  const rerunPath = resolveJobRerunFile(workspaceRoot, selected.id);
   let logText = null;
   if (logPath && fs.existsSync(logPath)) {
     logText = fs.readFileSync(logPath, "utf8");
-  }
-  let rerun = null;
-  if (fs.existsSync(rerunPath)) {
-    try {
-      rerun = JSON.parse(fs.readFileSync(rerunPath, "utf8"));
-    } catch {
-      rerun = null;
-    }
   }
   const bundle = {
     exportedAt: nowIso(),
     workspaceRoot,
     job: stored,
-    log: logText,
-    rerun
+    log: logText
   };
 
-  const outPath = options.out
-    ? path.resolve(cwd, options.out)
-    : path.join(resolveStateDir(workspaceRoot), "exports", `${selected.id}.export.json`);
+  const outPath = path.resolve(cwd, options.out);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, `${JSON.stringify(bundle, null, 2)}\n`, "utf8");
   return {
@@ -743,13 +853,12 @@ export function exportJobBundle(cwd, reference, options = {}) {
     jobId: selected.id,
     outPath,
     bytes: Buffer.byteLength(JSON.stringify(bundle), "utf8"),
-    hasLog: logText != null,
-    hasRerun: rerun != null
+    hasLog: logText != null
   };
 }
 
 /**
- * Read job log lines (tail). Returns structured payload for the logs command.
+ * Read job log lines (tail). Returns structured payload for status --logs.
  */
 export function readJobLogs(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -760,13 +869,13 @@ export function readJobLogs(cwd, reference, options = {}) {
   if (!selected) {
     throw new Error(reference
       ? `No job found for "${reference}".`
-      : "No Grok jobs found. Pass a job id to logs.");
+      : "No Grok jobs found. Pass a job id to status --logs.");
   }
   const stored = readStoredJob(workspaceRoot, selected.id) ?? selected;
   const logPath = stored.logPath || resolveJobLogFile(workspaceRoot, selected.id);
   const tail = options.tail == null ? DEFAULT_LOG_TAIL_LINES : Number(options.tail);
   if (!Number.isFinite(tail) || tail < 0 || !Number.isInteger(tail)) {
-    throw new Error("--tail must be a non-negative integer.");
+    throw new Error("--logs must be a non-negative integer.");
   }
   if (!logPath || !fs.existsSync(logPath)) {
     return {
@@ -797,10 +906,7 @@ export function readJobLogs(cwd, reference, options = {}) {
   };
 }
 
-/**
- * Resolve a confirmed Grok session for explicit --session-id / --resume-job.
- * Resolve a confirmed Grok session in the current workspace.
- */
+/** Resolve a confirmed Grok session for explicit --session-id / --resume-job. */
 export function resolveResumeTarget(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reconciledJobs(workspaceRoot, options));

@@ -7,7 +7,6 @@ import {
   renderExportReport,
   renderJobStatusReport,
   renderLogsReport,
-  renderRerunReport,
   renderSetupReport,
   renderStatusReport,
   renderStoredJobResult,
@@ -119,7 +118,7 @@ test("task and stored-result renderers preserve session and raw output", () => {
     rawOutput: "implementation complete",
     stderr: ""
   };
-  assert.match(renderTaskResult(payload), /grok --resume 44444444/);
+  assert.match(renderTaskResult(payload), /\$grok-delegate --session-id 44444444/);
   const stored = renderStoredJobResult({
     id: "task-123",
     kind: "task",
@@ -138,6 +137,7 @@ test("task and stored-result renderers preserve session and raw output", () => {
   assert.match(stored, /Session confirmed: yes/);
   assert.match(stored, /Resumable: yes/);
   assert.match(stored, /Exit code: 0/);
+  assert.match(stored, /\$grok-delegate --resume-job task-123/);
   assert.match(stored, /implementation complete/);
 });
 
@@ -230,7 +230,7 @@ test("review renderer preserves valid findings when Grok exits non-zero", () => 
   assert.doesNotMatch(rendered, /did not return valid structured review output/);
 });
 
-test("logs cleanup export rerun and bulk cancel renderers produce readable reports", () => {
+test("logs cleanup export and bulk cancel renderers produce readable reports", () => {
   assert.match(renderLogsReport({
     jobId: "task-1",
     logPath: "C:\\state\\task-1.log",
@@ -248,16 +248,8 @@ test("logs cleanup export rerun and bulk cancel renderers produce readable repor
   assert.match(renderExportReport({
     jobId: "task-1",
     outPath: "C:\\repo\\task-1.export.json",
-    hasLog: true,
-    hasRerun: true
-  }), /Includes rerun payload: yes/);
-  assert.match(renderRerunReport({
-    sourceJobId: "task-1",
-    jobId: "task-2",
-    status: "queued",
-    summary: "again",
-    logPath: "C:\\state\\task-2.log"
-  }), /Reran job task-1 as task-2/);
+    hasLog: true
+  }), /Includes log: yes/);
   assert.match(renderCancelReport({
     requestedCount: 2,
     cancelledCount: 2,
@@ -266,4 +258,11 @@ test("logs cleanup export rerun and bulk cancel renderers produce readable repor
       { jobId: "b", status: "cancelled", method: "taskkill" }
     ]
   }), /Cancelled 2 of 2/);
+  assert.match(renderCancelReport({
+    jobId: "task-pending",
+    previousStatus: "queued",
+    status: "cancel-requested",
+    delivered: false,
+    errorMessage: "Worker PID not available yet."
+  }), /process exit is not confirmed yet/);
 });

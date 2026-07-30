@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { cancelTrackedJob } from "../plugins/grok-companion/scripts/lib/job-control.mjs";
+import { cancelTrackedJob, reconcileOrphanedJob } from "../plugins/grok-companion/scripts/lib/job-control.mjs";
 import {
   binaryAvailable,
   getProcessIdentity,
@@ -17,7 +17,7 @@ import {
   spawnDetachedProcess,
   terminateProcessTree
 } from "../plugins/grok-companion/scripts/lib/process.mjs";
-import { readJobFile, resolveJobFile, upsertJob, writeJobFile } from "../plugins/grok-companion/scripts/lib/state.mjs";
+import { listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "../plugins/grok-companion/scripts/lib/state.mjs";
 import { initRepo, removeTempDir, tempDir } from "./helpers.mjs";
 
 test("POSIX termination falls back from a missing process group to the process", () => {
@@ -519,7 +519,9 @@ test("cancel helper does not report cancelled when termination is not delivered"
     isProcessAliveImpl(_pid, options) {
       aliveOptions = options;
       return true;
-    }
+    },
+    retryDelaysMs: [],
+    sleepImpl: () => {}
   });
   const stored = readJobFile(resolveJobFile(repo, job.id));
   assert.equal(result.status, "cancel-failed");
@@ -538,13 +540,21 @@ test("cancel helper does not report cancelled when termination is not delivered"
   upsertJob(repo, goneJob);
   const gone = cancelTrackedJob(repo, goneJob, {
     terminateImpl: () => ({ attempted: true, delivered: false, method: null }),
-    isProcessAliveImpl: () => false
+    isProcessAliveImpl: () => false,
+    retryDelaysMs: [1, 1],
+    sleepImpl: () => {}
   });
   const goneStored = readJobFile(resolveJobFile(repo, goneJob.id));
-  assert.equal(gone.status, "cancelled");
+  assert.equal(gone.status, "cancel-requested");
   assert.equal(gone.delivered, false);
-  assert.equal(goneStored.terminationMethod, "already-exited");
-  assert.ok(goneStored.cancelledAt);
+  assert.equal(goneStored.status, "running");
+  assert.equal(goneStored.phase, "cancel-requested");
+  assert.equal(goneStored.pid, 5678);
+  assert.ok(goneStored.cancelRequestedAt);
+  const reclaimed = reconcileOrphanedJob(repo, goneStored, { isProcessAliveImpl: () => false });
+  assert.equal(reclaimed.status, "cancelled");
+  assert.equal(reclaimed.terminationDelivered, false);
+  assert.equal(reclaimed.terminationMethod, "already-exited");
 
   const queued = {
     ...job,
@@ -557,8 +567,233 @@ test("cancel helper does not report cancelled when termination is not delivered"
   };
   writeJobFile(repo, queued.id, queued);
   upsertJob(repo, queued);
-  const beforePid = cancelTrackedJob(repo, queued);
-  assert.equal(beforePid.status, "cancelled");
+  const beforePid = cancelTrackedJob(repo, queued, {
+    retryDelaysMs: [1, 1],
+    sleepImpl: () => {}
+  });
+  assert.equal(beforePid.status, "cancel-requested");
   assert.equal(beforePid.delivered, false);
-  assert.equal(beforePid.method, "marked-before-worker-pid");
+  assert.equal(beforePid.method, null);
+  const queuedStored = readJobFile(resolveJobFile(repo, queued.id));
+  assert.equal(queuedStored.status, "queued");
+  assert.equal(queuedStored.phase, "cancel-requested");
+});
+
+test("cancel confirms exit after an undelivered kill once an observed process disappears", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const previousHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = path.join(root, "state");
+  t.after(() => {
+    if (previousHome == null) delete process.env.GROK_COMPANION_HOME;
+    else process.env.GROK_COMPANION_HOME = previousHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const job = {
+    id: "task-cancel-retry-exit",
+    kind: "task",
+    title: "Task",
+    status: "running",
+    phase: "running",
+    pid: 5151,
+    processName: "node",
+    processStartedAtMs: 51_510,
+    cwd: repo,
+    workspaceRoot: repo,
+    summary: "test",
+    createdAt: new Date().toISOString(),
+    logPath: path.join(repo, "retry-exit.log")
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, job.id, job);
+  upsertJob(repo, job);
+
+  let attempts = 0;
+  let alive = true;
+  const observedOptions = [];
+  const result = cancelTrackedJob(repo, job, {
+    retryDelaysMs: [1, 1, 1],
+    sleepImpl: () => {},
+    isProcessAliveImpl(_pid, options) {
+      observedOptions.push(options);
+      return alive;
+    },
+    terminateImpl(_pid, options) {
+      attempts += 1;
+      observedOptions.push(options);
+      alive = false;
+      return { attempted: true, delivered: false, method: "taskkill" };
+    }
+  });
+
+  assert.equal(attempts, 1);
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.delivered, false);
+  assert.equal(result.method, "taskkill");
+  assert.ok(observedOptions.every((options) => options.expectedName === "node"));
+  assert.ok(observedOptions.every((options) => options.expectedStartedAtMs === 51_510));
+});
+
+test("cancel retries an undelivered kill until delivery succeeds", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const previousHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = path.join(root, "state");
+  t.after(() => {
+    if (previousHome == null) delete process.env.GROK_COMPANION_HOME;
+    else process.env.GROK_COMPANION_HOME = previousHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const job = {
+    id: "task-cancel-retry-deliver",
+    kind: "task",
+    title: "Task",
+    status: "running",
+    phase: "running",
+    pid: 4242,
+    cwd: repo,
+    workspaceRoot: repo,
+    summary: "test",
+    createdAt: new Date().toISOString(),
+    logPath: path.join(repo, "retry-deliver.log")
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, job.id, job);
+  upsertJob(repo, job);
+
+  let attempts = 0;
+  const sleeps = [];
+  const result = cancelTrackedJob(repo, job, {
+    retryDelaysMs: [5, 5, 5],
+    sleepImpl: (ms) => sleeps.push(ms),
+    isProcessAliveImpl: () => true,
+    terminateImpl() {
+      attempts += 1;
+      return { attempted: true, delivered: attempts > 1, method: "taskkill" };
+    }
+  });
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(sleeps, [5]);
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.delivered, true);
+});
+
+test("cancel reports the actual terminal winner when the worker completes concurrently", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const previousHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = path.join(root, "state");
+  t.after(() => {
+    if (previousHome == null) delete process.env.GROK_COMPANION_HOME;
+    else process.env.GROK_COMPANION_HOME = previousHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const job = {
+    id: "task-cancel-terminal-race",
+    kind: "task",
+    title: "Task",
+    status: "running",
+    phase: "running",
+    pid: 6262,
+    cwd: repo,
+    workspaceRoot: repo,
+    summary: "test",
+    createdAt: new Date().toISOString(),
+    logPath: path.join(repo, "terminal-race.log")
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, job.id, job);
+  upsertJob(repo, job);
+
+  const result = cancelTrackedJob(repo, job, {
+    retryDelaysMs: [],
+    sleepImpl: () => {},
+    isProcessAliveImpl: () => true,
+    terminateImpl() {
+      const current = readJobFile(resolveJobFile(repo, job.id));
+      writeJobFile(repo, job.id, {
+        ...current,
+        status: "completed",
+        phase: "completed",
+        pid: null,
+        completedAt: new Date().toISOString(),
+        exitCode: 0
+      });
+      return { attempted: true, delivered: true, method: "test-signal" };
+    }
+  });
+
+  assert.equal(result.status, "completed");
+  assert.equal(result.job.status, "completed");
+  assert.equal(readJobFile(resolveJobFile(repo, job.id)).status, "completed");
+  assert.equal(listJobs(repo).find((entry) => entry.id === job.id)?.status, "completed");
+});
+
+test("cancel waits for PID publication before terminating", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const previousHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = path.join(root, "state");
+  t.after(() => {
+    if (previousHome == null) delete process.env.GROK_COMPANION_HOME;
+    else process.env.GROK_COMPANION_HOME = previousHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const job = {
+    id: "task-cancel-wait-pid",
+    kind: "task",
+    title: "Task",
+    status: "queued",
+    phase: "queued",
+    pid: null,
+    cwd: repo,
+    workspaceRoot: repo,
+    summary: "test",
+    createdAt: new Date().toISOString(),
+    logPath: path.join(repo, "wait-pid.log")
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, job.id, job);
+  upsertJob(repo, job);
+
+  let sleepCount = 0;
+  let terminateCalls = 0;
+  const result = cancelTrackedJob(repo, job, {
+    retryDelaysMs: [1, 1, 1],
+    sleepImpl() {
+      sleepCount += 1;
+      if (sleepCount === 1) {
+        writeJobFile(repo, job.id, {
+          ...readJobFile(resolveJobFile(repo, job.id)),
+          pid: 7777,
+          status: "running",
+          phase: "starting"
+        });
+      }
+    },
+    isProcessAliveImpl: (pid) => pid === 7777,
+    terminateImpl(pid) {
+      terminateCalls += 1;
+      assert.equal(pid, 7777);
+      return { attempted: true, delivered: true, method: "taskkill" };
+    }
+  });
+
+  assert.ok(sleepCount >= 1);
+  assert.equal(terminateCalls, 1);
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.delivered, true);
 });

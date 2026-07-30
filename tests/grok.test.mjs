@@ -8,7 +8,6 @@ import {
   buildGrokArgs,
   clearGrokCapabilityCache,
   compareGrokVersions,
-  findLatestTaskSession,
   getGrokAuthStatus,
   getGrokAvailability,
   getGrokCapabilities,
@@ -22,20 +21,6 @@ import {
 import { isProcessAlive } from "../plugins/grok-companion/scripts/lib/process.mjs";
 import { renderTaskResult } from "../plugins/grok-companion/scripts/lib/render.mjs";
 import { FAKE_GROK, tempDir } from "./helpers.mjs";
-
-test("findLatestTaskSession returns no candidate without workspace jobs", () => {
-  const root = tempDir();
-  const previous = process.env.GROK_COMPANION_HOME;
-  process.env.GROK_COMPANION_HOME = path.join(root, "state");
-  try {
-    assert.equal(findLatestTaskSession(root), null);
-  } finally {
-    previous === undefined
-      ? delete process.env.GROK_COMPANION_HOME
-      : process.env.GROK_COMPANION_HOME = previous;
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
 
 test("read-only Grok argv uses plan mode and a strict tool allowlist", () => {
   const { args, sessionId } = buildGrokArgs({

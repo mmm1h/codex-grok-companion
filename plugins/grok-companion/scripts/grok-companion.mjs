@@ -10,7 +10,6 @@ import { normalizeArgv, parseArgs } from "./lib/args.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, resolveReviewTarget } from "./lib/git.mjs";
 import {
-  findLatestTaskSession,
   getGrokAuthStatus,
   getGrokAvailability,
   getGrokCapabilities,
@@ -24,8 +23,8 @@ import {
   cancelTrackedJob,
   cancelTrackedJobsParallel,
   cleanupJobs,
+  DEFAULT_LOG_TAIL_LINES,
   exportJobBundle,
-  loadJobRerunSnapshot,
   readJobLogs,
   readStoredJob,
   reconcileSessionJobs,
@@ -33,7 +32,6 @@ import {
   resolveCancelableJobs,
   resolveResultJob,
   resolveResumeTarget,
-  saveJobRerunSnapshot,
   WAIT_TIMEOUT_EXIT_CODE
 } from "./lib/job-control.mjs";
 import {
@@ -49,7 +47,6 @@ import {
   renderJobStatusReport,
   renderLogsReport,
   renderQueuedLaunch,
-  renderRerunReport,
   renderReviewResult,
   renderSetupReport,
   renderStatusReport,
@@ -72,6 +69,7 @@ import {
   createJobRecord,
   createProgressReporter,
   indexJobRecord,
+  publishDetachedWorkerPid,
   runTrackedJob
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -99,19 +97,15 @@ function usage() {
     "  grok-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]",
     "                     [--model <id>] [--timeout-ms <ms>] [--inline-diff-max-files N]",
     "                     [--inline-diff-max-bytes N] [--focus-file <path>] [--json] [focus...]",
-    "  grok-companion.mjs task [--background] [--write|--read-only] [--resume-last|--resume|--fresh]",
+    "  grok-companion.mjs task [--background] [--write|--read-only] [--fresh]",
     "                     [--session-id <id>] [--resume-job <job-id>] [--model <id>] [--effort <level>]",
     "                     [--timeout-ms <ms>] [--prompt-file <path>|--stdin] [--json] [prompt]",
-    "  grok-companion.mjs task-resume-candidate [--json]",
     "  grok-companion.mjs status [job-id] [--all] [--kind <kind>] [--status <status>] [--limit N]",
-    "                     [--progress-lines N] [--wait] [--with-result] [--timeout-ms <ms>]",
+    "                     [--progress-lines N] [--logs [N]] [--wait] [--with-result] [--timeout-ms <ms>]",
     "                     [--poll-interval-ms <ms>] [--json]",
-    "  grok-companion.mjs result [job-id] [--wait] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]",
+    "  grok-companion.mjs result [job-id] [--wait] [--out <path>] [--timeout-ms <ms>] [--poll-interval-ms <ms>] [--json]",
     "  grok-companion.mjs cancel [job-id] [--all] [--kind <kind>] [--json]",
-    "  grok-companion.mjs logs [job-id] [--tail N] [--json]",
-    "  grok-companion.mjs cleanup [--older-than <duration>] [--keep N] [--dry-run] [--json]",
-    "  grok-companion.mjs export <job-id> [--out <path>] [--json]",
-    "  grok-companion.mjs rerun [job-id] [--background] [--json]"
+    "  grok-companion.mjs cleanup [--older-than <duration>] [--keep N] [--dry-run] [--json]"
   ].join("\n");
 }
 
@@ -507,8 +501,6 @@ function persistWorkerLaunchFailure(job, error) {
 }
 
 async function enqueue(job) {
-  // Sidecar before worker spawn so terminal strip of request still leaves a rerun path.
-  saveJobRerunSnapshot(job.workspaceRoot, job);
   const logPath = createJobLogFile(job.workspaceRoot, job.id, job.title);
   const queued = {
     ...job,
@@ -532,18 +524,7 @@ async function enqueue(job) {
     cwd: job.cwd,
     env: process.env
   });
-  const latest = readStoredJob(job.workspaceRoot, job.id);
-  if (latest?.status === "queued") {
-    const withPid = {
-      ...latest,
-      pid: child.pid,
-      processName: identity?.name ?? path.basename(process.execPath),
-      processStartedAtMs: identity?.startedAtMs ?? Date.now(),
-      workerSpawnedAt: new Date().toISOString()
-    };
-    writeJobFile(job.workspaceRoot, job.id, withPid);
-    upsertJob(job.workspaceRoot, indexJobRecord(withPid));
-  }
+  publishDetachedWorkerPid(job.workspaceRoot, job.id, child.pid, identity);
   return {
     jobId: job.id,
     status: "queued",
@@ -593,21 +574,22 @@ async function handleReview(argv, adversarial) {
     const payload = await enqueue(job);
     output(payload, renderQueuedLaunch(payload), options.json);
   } else {
-    saveJobRerunSnapshot(job.workspaceRoot, job);
     await runForeground(job, options.json);
   }
 }
 
 async function handleTask(argv) {
-  const { options, positionals } = commandInput(argv, {
+  const normalized = normalizeArgv(argv);
+  if (normalized.some((token) => /^--resume(?:=|$)|^--resume-last(?:=|$)/.test(token))) {
+    throw new Error("Implicit resume was removed; pass --resume-job <job-id> or --session-id <id> explicitly.");
+  }
+  const { options, positionals } = commandInput(normalized, {
     valueOptions: ["cwd", "prompt-file", "model", "effort", "timeout-ms", "session-id", "resume-job"],
     booleanOptions: [
       "json",
       "background",
       "write",
       "read-only",
-      "resume-last",
-      "resume",
       "fresh",
       "stdin"
     ]
@@ -616,18 +598,15 @@ async function handleTask(argv) {
     throw new Error("Choose either --write or --read-only.");
   }
   const wantsResume = Boolean(
-    options["resume-last"]
-    || options.resume
-    || options["session-id"]
+    options["session-id"]
     || options["resume-job"]
   );
   if (wantsResume && options.fresh) {
-    throw new Error("Choose either a resume option (--resume/--resume-last/--session-id/--resume-job) or --fresh.");
+    throw new Error("Choose either an explicit resume option (--session-id/--resume-job) or --fresh.");
   }
   const cwd = commandCwd(options);
   requireAvailable(cwd);
-  // Reclaim dead-PID "running" orphans before resume lookup / enqueue so they
-  // cannot permanently block findLatestTaskSession.
+  // Reclaim dead-PID jobs before explicit resume lookup or enqueue.
   reconcileSessionJobs(resolveWorkspaceRoot(cwd));
   let prompt = readPrompt(cwd, options, positionals);
   if (!prompt) {
@@ -644,11 +623,6 @@ async function handleTask(argv) {
       sessionId: options["session-id"] ?? null,
       resumeJob: options["resume-job"] ?? null
     });
-  } else if (options["resume-last"] || options.resume) {
-    resume = findLatestTaskSession(cwd);
-    if (!resume) {
-      throw new Error("No resumable Grok task session was found for the current workspace.");
-    }
   }
 
   const write = options.write === true;
@@ -683,36 +657,8 @@ async function handleTask(argv) {
     const payload = await enqueue(job);
     output(payload, renderQueuedLaunch(payload), options.json);
   } else {
-    saveJobRerunSnapshot(job.workspaceRoot, job);
     await runForeground(job, options.json);
   }
-}
-
-function handleTaskResumeCandidate(argv) {
-  const { options } = commandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
-  });
-  const cwd = commandCwd(options);
-  // Same orphan reclaim as task — candidate lookup uses findLatestTaskSession.
-  reconcileSessionJobs(resolveWorkspaceRoot(cwd));
-  const availability = getGrokAvailability(cwd);
-  const candidate = availability.available ? findLatestTaskSession(cwd) : null;
-  const payload = {
-    available: Boolean(candidate),
-    grokAvailable: availability.available,
-    sessionId: candidate?.sessionId ?? null,
-    source: candidate?.source ?? null,
-    jobId: candidate?.jobId ?? null,
-    status: candidate?.status ?? null,
-    summary: candidate?.summary ?? null,
-    updatedAt: candidate?.updatedAt ?? null,
-    sessionConfirmed: Boolean(candidate?.sessionConfirmed),
-    resumable: Boolean(candidate?.resumable)
-  };
-  output(payload, payload.available
-    ? `Resumable Grok session: ${payload.sessionId}\n`
-    : "No resumable Grok task session found.\n", options.json);
 }
 
 async function waitForJob(cwd, reference, timeoutMs, options = {}) {
@@ -733,8 +679,27 @@ async function waitForJob(cwd, reference, timeoutMs, options = {}) {
   };
 }
 
+function expandOptionalLogsFlag(argv, defaultTail = DEFAULT_LOG_TAIL_LINES) {
+  const expanded = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--logs") {
+      const next = argv[index + 1];
+      if (next === undefined || next.startsWith("-") || !/^\d+$/.test(next)) {
+        expanded.push("--logs", String(defaultTail));
+      } else {
+        expanded.push("--logs", next);
+        index += 1;
+      }
+      continue;
+    }
+    expanded.push(token);
+  }
+  return expanded;
+}
+
 async function handleStatus(argv) {
-  const { options, positionals } = commandInput(argv, {
+  const { options, positionals } = parseArgs(expandOptionalLogsFlag(normalizeArgv(argv)), {
     valueOptions: [
       "cwd",
       "timeout-ms",
@@ -742,12 +707,17 @@ async function handleStatus(argv) {
       "status",
       "limit",
       "progress-lines",
+      "logs",
       "poll-interval-ms"
     ],
-    booleanOptions: ["json", "all", "wait", "with-result"]
+    booleanOptions: ["json", "all", "wait", "with-result"],
+    aliasMap: { C: "cwd" }
   });
   const cwd = commandCwd(options);
   const reference = positionals[0] ?? "";
+  if (positionals.length > 1) {
+    throw new Error("`status` accepts at most one job id; `--logs` accepts an optional non-negative line count.");
+  }
   const timeoutMs = options["timeout-ms"] == null
     ? DEFAULT_STATUS_WAIT_TIMEOUT_MS
     : parseNonNegativeInt(options["timeout-ms"], "--timeout-ms");
@@ -760,6 +730,19 @@ async function handleStatus(argv) {
   const maxJobs = options.limit == null
     ? undefined
     : parsePositiveInt(options.limit, "--limit");
+
+  if (options.logs != null) {
+    if (options.wait || options["with-result"]) {
+      throw new Error("`status --logs` cannot be combined with --wait or --with-result.");
+    }
+    if (options.all || options.kind != null || options.status != null || options.limit != null || options["progress-lines"] != null) {
+      throw new Error("`status --logs` cannot be combined with list filters or --progress-lines.");
+    }
+    const tail = parseNonNegativeInt(options.logs, "--logs");
+    const payload = readJobLogs(cwd, reference, { tail });
+    output(payload, renderLogsReport(payload), options.json);
+    return;
+  }
 
   if (options.wait && !reference) {
     throw new Error("`status --wait` requires a job id.");
@@ -808,11 +791,22 @@ async function handleStatus(argv) {
 
 async function handleResult(argv) {
   const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms", "out"],
     booleanOptions: ["json", "wait"]
   });
   const cwd = commandCwd(options);
   const reference = positionals[0] ?? "";
+  if (options.out != null) {
+    if (options.wait) {
+      throw new Error("`result --out` cannot be combined with --wait.");
+    }
+    if (!reference) {
+      throw new Error("`result --out` requires a job id.");
+    }
+    const payload = exportJobBundle(cwd, reference, { out: options.out });
+    output(payload, renderExportReport(payload), options.json);
+    return;
+  }
   if (options.wait) {
     if (!reference) {
       throw new Error("`result --wait` requires a job id.");
@@ -905,18 +899,6 @@ async function handleCancel(argv) {
   }
 }
 
-function handleLogs(argv) {
-  const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd", "tail"],
-    booleanOptions: ["json"]
-  });
-  const cwd = commandCwd(options);
-  const reference = positionals[0] ?? "";
-  const tail = options.tail == null ? undefined : parseNonNegativeInt(options.tail, "--tail");
-  const payload = readJobLogs(cwd, reference, { tail });
-  output(payload, renderLogsReport(payload), options.json);
-}
-
 function handleCleanup(argv) {
   const { options } = commandInput(argv, {
     valueOptions: ["cwd", "older-than", "keep"],
@@ -933,82 +915,6 @@ function handleCleanup(argv) {
     dryRun: Boolean(options["dry-run"])
   });
   output(payload, renderCleanupReport(payload), options.json);
-}
-
-function handleExport(argv) {
-  const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd", "out"],
-    booleanOptions: ["json"]
-  });
-  const cwd = commandCwd(options);
-  const reference = positionals[0] ?? "";
-  if (!reference) {
-    throw new Error("`export` requires a job id.");
-  }
-  const payload = exportJobBundle(cwd, reference, { out: options.out ?? null });
-  output(payload, renderExportReport(payload), options.json);
-}
-
-async function handleRerun(argv) {
-  const { options, positionals } = commandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json", "background"]
-  });
-  const cwd = commandCwd(options);
-  requireAvailable(cwd);
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const reference = positionals[0] ?? "";
-  if (!reference) {
-    throw new Error("`rerun` requires a job id.");
-  }
-  // Prefer the explicit job reference; fall back to finished-job resolution for prefixes.
-  let sourceJob;
-  try {
-    const resolved = resolveResultJob(cwd, reference, { env: process.env, all: true });
-    sourceJob = readStoredJob(resolved.workspaceRoot, resolved.job.id) ?? resolved.job;
-  } catch {
-    const snapshot = buildSingleJobSnapshot(cwd, reference);
-    sourceJob = readStoredJob(snapshot.workspaceRoot, snapshot.job.id) ?? snapshot.job;
-  }
-  if (["queued", "running"].includes(sourceJob.status)) {
-    throw new Error(`Job ${sourceJob.id} is still ${sourceJob.status}; cancel it or wait before rerunning.`);
-  }
-
-  const sidecar = loadJobRerunSnapshot(workspaceRoot, sourceJob.id);
-  const request = sidecar?.request ?? sourceJob.request ?? null;
-  if (!request || typeof request !== "object") {
-    throw new Error(
-      `No rerun payload found for job ${sourceJob.id}. `
-      + "Jobs finished before this companion version, or pruned without a sidecar, cannot be rerun."
-    );
-  }
-
-  const kind = sidecar?.kind ?? sourceJob.kind ?? request.type ?? "task";
-  const title = `Rerun: ${sidecar?.title ?? sourceJob.title ?? kind}`;
-  const summary = sidecar?.summary ?? sourceJob.summary ?? shorten(request.prompt ?? title);
-  const write = sidecar?.write ?? sourceJob.write ?? Boolean(request.write);
-  // Fresh job id; do not resume the prior Grok session unless the stored request already did.
-  const job = makeJob({
-    cwd: request.cwd ?? workspaceRoot,
-    kind,
-    title,
-    summary,
-    write,
-    request: { ...request },
-    sessionId: request.sessionId ?? null,
-    sessionConfirmed: Boolean(request.sessionConfirmed)
-  });
-
-  if (options.background) {
-    const payload = {
-      ...await enqueue(job),
-      sourceJobId: sourceJob.id
-    };
-    output(payload, renderRerunReport(payload), options.json);
-  } else {
-    saveJobRerunSnapshot(job.workspaceRoot, job);
-    await runForeground(job, options.json);
-  }
 }
 
 async function handleWorker(argv) {
@@ -1065,9 +971,6 @@ async function main() {
     case "task":
       await handleTask(argv);
       break;
-    case "task-resume-candidate":
-      handleTaskResumeCandidate(argv);
-      break;
     case "status":
       await handleStatus(argv);
       break;
@@ -1077,17 +980,8 @@ async function main() {
     case "cancel":
       await handleCancel(argv);
       break;
-    case "logs":
-      handleLogs(argv);
-      break;
     case "cleanup":
       handleCleanup(argv);
-      break;
-    case "export":
-      handleExport(argv);
-      break;
-    case "rerun":
-      await handleRerun(argv);
       break;
     case "job-worker":
       await handleWorker(argv);

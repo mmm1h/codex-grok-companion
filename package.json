@@ -1,6 +1,6 @@
 {
   "name": "@mmm1h/codex-grok-companion",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Use the local Grok CLI from Codex for reviews, delegated coding tasks, and background jobs.",

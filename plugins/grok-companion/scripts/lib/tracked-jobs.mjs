@@ -121,6 +121,31 @@ export function indexJobRecord(record) {
   };
 }
 
+export function publishDetachedWorkerPid(workspaceRoot, jobId, pid, identity = null) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  const published = updateJobFile(workspaceRoot, jobId, (latest) => {
+    if (!latest || (Number.isInteger(latest.pid) && latest.pid > 0)) {
+      return null;
+    }
+    if (!["queued", "running"].includes(latest.status)) {
+      return null;
+    }
+    return {
+      ...latest,
+      pid,
+      processName: identity?.name ?? path.basename(process.execPath),
+      processStartedAtMs: identity?.startedAtMs ?? Date.now(),
+      workerSpawnedAt: nowIso()
+    };
+  });
+  if (published && Number.isInteger(published.pid) && published.pid > 0) {
+    upsertJob(workspaceRoot, indexJobRecord(published));
+  }
+  return published;
+}
+
 function writeIndex(workspaceRoot, record) {
   upsertJob(workspaceRoot, indexJobRecord(record));
 }

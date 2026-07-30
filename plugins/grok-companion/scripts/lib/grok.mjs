@@ -7,8 +7,6 @@ import process from "node:process";
 
 import { createTempDir } from "./fs.mjs";
 import { binaryAvailable, resolveSpawnInvocation, runCommand, terminateProcessTree } from "./process.mjs";
-import { listJobs } from "./state.mjs";
-import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const INLINE_PROMPT_MAX_BYTES = 6 * 1024;
@@ -21,7 +19,6 @@ const capabilityCache = new Map();
 function grokBinary(options = {}) {
   return options.binary ?? process.env.GROK_COMPANION_GROK_BINARY ?? "grok";
 }
-
 function grokPrefixArgs(options = {}) {
   if (options.binaryPrefixArgs) {
     return options.binaryPrefixArgs;
@@ -1083,34 +1080,4 @@ export async function runGrokHeadless(options = {}) {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   }
-}
-
-export function findLatestTaskSession(cwd, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const scoped = [...listJobs(workspaceRoot)]
-    .filter((job) => job.kind === "task"
-      && resolveWorkspaceRoot(job.workspaceRoot ?? job.cwd) === workspaceRoot);
-  const active = scoped.find((job) => ["queued", "running"].includes(job.status));
-  if (active) {
-    throw new Error(`Cannot resume while Grok task ${active.id} is ${active.status} in this workspace.`);
-  }
-  const fromJobs = scoped
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .find((job) => ["completed", "failed", "cancelled"].includes(job.status)
-      && job.sessionId
-      && job.sessionConfirmed === true
-      && job.resumable === true);
-  if (fromJobs) {
-    return {
-      sessionId: fromJobs.sessionId,
-      source: "companion-job",
-      jobId: fromJobs.id,
-      status: fromJobs.status,
-      summary: fromJobs.summary,
-      updatedAt: fromJobs.updatedAt,
-      sessionConfirmed: true,
-      resumable: true
-    };
-  }
-  return null;
 }

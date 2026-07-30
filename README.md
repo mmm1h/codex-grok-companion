@@ -55,7 +55,7 @@ not ordinary Chat, mobile, or the IDE extension.
 | `$grok-review` | Structured read-only Git review |
 | `$grok-adversarial-review` | Focused challenge of design and failure modes |
 | `$grok-delegate` | Read-only or write-capable coding task delegation |
-| `$grok-jobs` | Status, result, logs, wait, cancel, rerun, export, and cleanup |
+| `$grok-jobs` | Status, result, logs, wait, cancel, export, and cleanup |
 
 Examples:
 
@@ -81,17 +81,19 @@ $grok-jobs show recent jobs
   interpolation.
 - Background work uses a detached Node worker with durable job records. It does
   not depend on the originating Codex chat staying open.
-- Resume candidates are scoped to the current Git workspace and require a
-  confirmed Grok session ID from a completed job.
+- Continuation is always explicit with `--resume-job <job-id>` or
+  `--session-id <id>`. Both resolve only confirmed Grok task sessions in the
+  current Git workspace; there is no implicit "resume latest" behavior.
 - State defaults to
   `$CODEX_HOME/state/plugins/grok-companion/<workspace>-<hash>/`, or
   `~/.codex/state/plugins/grok-companion/...` when `CODEX_HOME` is unset.
   Host-provided `PLUGIN_DATA` takes precedence over `CODEX_HOME`, and
   `GROK_COMPANION_HOME` takes precedence over both. `$grok-setup` reports the
   effective directory and selector.
-- Job exports default under the plugin state directory, outside the checkout.
-  Use `--out` only when an explicit export path is required; exports contain
-  prompts, logs, and model output.
+- Export a job explicitly with `result <job-id> --out <path>`. Exports contain
+  the terminal job record, logs, and model output. Prompt-bearing rerun
+  sidecars are not retained; job records still retain the shortened prompt
+  summary shown in status output.
 
 ## Data And Permissions
 
@@ -122,6 +124,8 @@ node plugins/grok-companion/scripts/grok-companion.mjs review --background
 node plugins/grok-companion/scripts/grok-companion.mjs task --read-only --prompt-file request.md
 node plugins/grok-companion/scripts/grok-companion.mjs task --write --prompt-file request.md
 node plugins/grok-companion/scripts/grok-companion.mjs status --all
+node plugins/grok-companion/scripts/grok-companion.mjs status <job-id> --logs 80
+node plugins/grok-companion/scripts/grok-companion.mjs result <job-id> --out job.json
 ```
 
 Direct `task` calls default to read-only. Write-capable execution requires an

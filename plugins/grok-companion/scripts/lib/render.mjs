@@ -223,7 +223,7 @@ export function renderTaskResult(payload, options = {}) {
   const lines = [
     `${options.title ?? "Grok Task"} ${payload.exitCode === 0 ? "completed" : "failed"}.`,
     payload.sessionId ? `Grok session ID: ${payload.sessionId}` : null,
-    canResume ? `Resume in Grok: grok --resume ${payload.sessionId}` : null,
+    canResume ? `Continue with $grok-delegate --session-id ${payload.sessionId}.` : null,
     "",
     String(payload.rawOutput || payload.stderr || "Grok returned no output.").trimEnd()
   ].filter((value) => value !== null);
@@ -346,7 +346,7 @@ export function renderStoredJobResult(storedJob) {
     `Resumable: ${yesNo(storedJob.resumable)}.`,
     storedJob.exitCode != null ? `Exit code: ${storedJob.exitCode}` : null,
     storedJob.sessionId ? `Grok session ID: ${storedJob.sessionId}` : null,
-    canResume ? `Resume in Grok: grok --resume ${storedJob.sessionId}` : null,
+    canResume ? `Continue with $grok-delegate --resume-job ${storedJob.id} or --session-id ${storedJob.sessionId}.` : null,
     storedJob.terminationMethod ? `Termination method: ${storedJob.terminationMethod}` : null,
     storedJob.terminationDelivered != null ? `Termination delivered: ${yesNo(storedJob.terminationDelivered)}.` : null,
     storedJob.cancelRequestedAt ? `Cancellation requested: ${storedJob.cancelRequestedAt}` : null,
@@ -380,6 +380,15 @@ export function renderCancelReport(payload) {
     }
     lines.push("");
     return lines.join("\n");
+  }
+  if (payload.status === "cancel-requested") {
+    return [
+      `Cancellation requested for Grok job ${payload.jobId}; process exit is not confirmed yet.`,
+      `Previous status: ${payload.previousStatus}.`,
+      `Process termination delivered: ${yesNo(payload.delivered)}.`,
+      `Pending: ${payload.errorMessage ?? "The job will be reconciled when its tracked process is confirmed gone."}`,
+      ""
+    ].join("\n");
   }
   if (payload.status !== "cancelled") {
     return [
@@ -439,17 +448,6 @@ export function renderExportReport(payload) {
     `Exported job ${payload.jobId}.`,
     `Output: ${payload.outPath}`,
     `Includes log: ${yesNo(payload.hasLog)}.`,
-    `Includes rerun payload: ${yesNo(payload.hasRerun)}.`,
     ""
   ].join("\n");
-}
-
-export function renderRerunReport(payload) {
-  return [
-    `Reran job ${payload.sourceJobId} as ${payload.jobId}.`,
-    `Status: ${payload.status}.`,
-    payload.summary ? `Summary: ${payload.summary}` : null,
-    payload.logPath ? `Log: ${payload.logPath}` : null,
-    ""
-  ].filter((value) => value !== null).join("\n");
 }
