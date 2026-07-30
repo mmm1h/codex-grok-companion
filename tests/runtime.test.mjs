@@ -846,7 +846,7 @@ test("status filters by kind/status/limit and cancel --all cancels active jobs",
   const repo = path.join(root, "repo");
   fs.mkdirSync(repo);
   initRepo(repo);
-  const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_DELAY_MS: "10000" });
+  const env = fakeGrokEnv(path.join(root, "state"), { FAKE_GROK_DELAY_MS: "30000" });
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
   const a = runCompanion(["task", "--background", "--json", "--cwd", repo, "cancel all a"], { env, cwd: repo });
@@ -855,8 +855,10 @@ test("status filters by kind/status/limit and cancel --all cancels active jobs",
   assert.equal(b.status, 0, b.stderr);
   const idA = JSON.parse(a.stdout).jobId;
   const idB = JSON.parse(b.stdout).jobId;
-  await waitForJob(repo, env, idA, (job) => job.status === "running");
-  await waitForJob(repo, env, idB, (job) => job.status === "running");
+  await Promise.all([
+    waitForJob(repo, env, idA, (job) => job.status === "running", 20_000),
+    waitForJob(repo, env, idB, (job) => job.status === "running", 20_000)
+  ]);
 
   const filtered = runCompanion(
     ["status", "--kind", "task", "--status", "running", "--limit", "1", "--json", "--cwd", repo],

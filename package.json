@@ -9,7 +9,7 @@
     "node": ">=18.18.0"
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --test",
     "test:smoke": "node plugins/grok-companion/scripts/grok-companion.mjs setup --json"
   }
 }
