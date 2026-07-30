@@ -500,19 +500,11 @@ function readProcessIdentity(pid, options = {}) {
     return null;
   }
 
-  // POSIX: prefer /proc, fall back to ps.
+  // POSIX: /proc gives us the cheapest process name, but its directory
+  // timestamps are not stable process-start identifiers. Use ps for start time.
+  let procName = null;
   try {
-    const comm = fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim();
-    let startedAtMs = null;
-    try {
-      const procStat = fs.statSync(`/proc/${pid}`);
-      startedAtMs = procStat.birthtimeMs || procStat.ctimeMs || null;
-    } catch {
-      // ignore
-    }
-    if (comm) {
-      return { pid, name: comm, startedAtMs };
-    }
+    procName = fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim() || null;
   } catch {
     // /proc unavailable (macOS etc.)
   }
@@ -533,11 +525,14 @@ function readProcessIdentity(pid, options = {}) {
     if (match) {
       return {
         pid,
-        name: match[2].trim().split(/[\\/]/).pop() ?? match[2].trim(),
+        name: procName ?? (match[2].trim().split(/[\\/]/).pop() ?? match[2].trim()),
         startedAtMs: Date.parse(match[1])
       };
     }
-    return { pid, name: line.split(/\s+/).pop() ?? null, startedAtMs: null };
+    return { pid, name: procName ?? (line.split(/\s+/).pop() ?? null), startedAtMs: null };
+  }
+  if (procName) {
+    return { pid, name: procName, startedAtMs: null };
   }
   return null;
 }
@@ -574,33 +569,40 @@ function normalizeProcessName(name) {
  * Optional identity match for PID-reuse safety.
  * When no expected* fields are provided, always matches (backward compatible).
  */
-export function processIdentityMatches(identity, options = {}) {
+function processIdentityState(identity, options = {}) {
   if (!options.expectedName && options.expectedStartedAt == null && options.expectedStartedAtMs == null) {
-    return true;
+    return "match";
   }
   if (!identity) {
-    return false;
+    return "unavailable";
   }
   if (options.expectedName) {
     const expected = normalizeProcessName(options.expectedName);
     const actual = normalizeProcessName(identity.name);
-    if (!actual || actual !== expected) {
-      return false;
+    if (!actual) {
+      return "unavailable";
+    }
+    if (actual !== expected) {
+      return "mismatch";
     }
   }
   const expectedMs = options.expectedStartedAtMs
     ?? (options.expectedStartedAt != null ? Date.parse(String(options.expectedStartedAt)) : null);
   if (expectedMs != null && Number.isFinite(expectedMs)) {
     if (identity.startedAtMs == null || !Number.isFinite(identity.startedAtMs)) {
-      return false;
+      return "unavailable";
     }
     // Allow skew between job bookkeeping and OS process start.
     const skewMs = options.startTimeSkewMs ?? PROCESS_START_TIME_SKEW_MS;
     if (Math.abs(identity.startedAtMs - expectedMs) > skewMs) {
-      return false;
+      return "mismatch";
     }
   }
-  return true;
+  return "match";
+}
+
+export function processIdentityMatches(identity, options = {}) {
+  return processIdentityState(identity, options) === "match";
 }
 
 function signalAlive(pid, kill) {
@@ -612,22 +614,34 @@ function signalAlive(pid, kill) {
   }
 }
 
-export function isProcessAlive(pid, options = {}) {
+/**
+ * Inspect liveness separately from optional PID-reuse identity checks.
+ * Callers that reconcile durable state need the distinction between a dead PID
+ * and a live PID whose identity is temporarily unavailable or mismatched.
+ */
+export function inspectProcess(pid, options = {}) {
   if (!Number.isInteger(pid) || pid <= 0) {
-    return false;
+    return { state: "dead", identity: null };
   }
   const kill = options.killImpl ?? process.kill.bind(process);
   if (!signalAlive(pid, kill)) {
-    return false;
+    return { state: "dead", identity: null };
   }
-  // Backward compatible: no identity expectations → alive if kill(pid,0) succeeds.
   if (!options.expectedName && options.expectedStartedAt == null && options.expectedStartedAtMs == null) {
-    return true;
+    return { state: "alive", identity: null };
   }
   const identity = typeof options.getIdentityImpl === "function"
     ? options.getIdentityImpl(pid, options)
     : getProcessIdentity(pid, options);
-  return processIdentityMatches(identity, options);
+  const identityState = processIdentityState(identity, options);
+  return {
+    state: identityState === "match" ? "alive" : `identity-${identityState}`,
+    identity
+  };
+}
+
+export function isProcessAlive(pid, options = {}) {
+  return inspectProcess(pid, options).state === "alive";
 }
 
 function collectDescendantPids(pid, options = {}) {

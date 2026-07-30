@@ -26,6 +26,7 @@ import {
   cleanupJobs,
   DEFAULT_LOG_TAIL_LINES,
   exportJobBundle,
+  finalizeCancelledJob,
   readJobLogs,
   readStoredJob,
   reconcileSessionJobs,
@@ -938,10 +939,31 @@ async function handleWorker(argv) {
   if (!job?.request) {
     throw new Error(`Stored job ${options["job-id"]} has no request payload.`);
   }
+  // A queued job may be observed before or after the launcher publishes this
+  // worker's PID. Never let a foreign worker execute or finalize it.
+  const runnable = (
+    job.status === "queued"
+    && (!job.pid || job.pid === process.pid)
+  ) || (
+    job.status === "running"
+    && job.pid === process.pid
+  );
+  if (
+    runnable
+    && (
+      job.cancelRequestedAt
+      || job.phase === "cancel-requested"
+      || job.phase === "cancel-failed"
+    )
+  ) {
+    finalizeCancelledJob(workspaceRoot, job, {
+      terminationMethod: "cancelled-before-start",
+      logMessage: "Cancelled before the background worker began executing Grok."
+    });
+    return;
+  }
   // Only queued jobs (or a running job already owned by this process) may execute.
   // Reject completed/cancelled/failed/foreign-running re-entry so results are not overwritten.
-  const runnable = job.status === "queued"
-    || (job.status === "running" && job.pid === process.pid);
   if (!runnable) {
     const reason = `job-worker refused to run job ${job.id}: status is "${job.status}"`
       + (job.pid != null ? ` (pid ${job.pid})` : "")

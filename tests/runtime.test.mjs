@@ -571,6 +571,126 @@ test("job-worker refuses to re-run completed or cancelled jobs", (t) => {
   assert.deepEqual(stored.result, originalResult);
 });
 
+test("job-worker honors a cancellation request before executing Grok", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const capture = path.join(root, "capture.json");
+  const env = fakeGrokEnv(state, { FAKE_GROK_CAPTURE: capture });
+  const previousStateHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = state;
+  t.after(() => {
+    previousStateHome === undefined
+      ? delete process.env.GROK_COMPANION_HOME
+      : process.env.GROK_COMPANION_HOME = previousStateHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const id = "task-cancel-before-worker";
+  const logPath = path.join(repo, `${id}.log`);
+  fs.writeFileSync(logPath, "", "utf8");
+  const job = {
+    id,
+    kind: "task",
+    title: "Grok Task",
+    status: "queued",
+    phase: "cancel-requested",
+    pid: null,
+    cancelRequestedAt: new Date().toISOString(),
+    cwd: repo,
+    workspaceRoot: repo,
+    summary: "cancelled before worker",
+    createdAt: new Date().toISOString(),
+    logPath,
+    resultPath: resolveJobFile(repo, id),
+    request: {
+      type: "task",
+      cwd: repo,
+      prompt: "must not run",
+      write: false,
+      model: null,
+      effort: null,
+      sessionId: null,
+      sessionConfirmed: false,
+      resumeSessionId: null,
+      timeoutMs: null,
+      title: "Grok Task"
+    }
+  };
+  writeJobFile(repo, id, job);
+  upsertJob(repo, indexJobRecord(job));
+
+  const worker = runCompanion(["job-worker", "--cwd", repo, "--job-id", id], { env, cwd: repo });
+  assert.equal(worker.status, 0, worker.stderr);
+  assert.equal(fs.existsSync(capture), false);
+  const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, id), "utf8"));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.phase, "cancelled");
+  assert.equal(stored.terminationMethod, "cancelled-before-start");
+  assert.equal("request" in stored, false);
+});
+
+test("foreign job-worker cannot finalize another worker's cancellation", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  const state = path.join(root, "state");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const env = fakeGrokEnv(state);
+  const previousStateHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = state;
+  t.after(() => {
+    previousStateHome === undefined
+      ? delete process.env.GROK_COMPANION_HOME
+      : process.env.GROK_COMPANION_HOME = previousStateHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const id = "task-cancel-foreign-worker";
+  const job = {
+    id,
+    kind: "task",
+    title: "Grok Task",
+    status: "running",
+    phase: "cancel-requested",
+    pid: 999_999,
+    cancelRequestedAt: new Date().toISOString(),
+    cwd: repo,
+    workspaceRoot: repo,
+    summary: "owned elsewhere",
+    createdAt: new Date().toISOString(),
+    logPath: path.join(repo, `${id}.log`),
+    resultPath: resolveJobFile(repo, id),
+    request: {
+      type: "task",
+      cwd: repo,
+      prompt: "must remain owned elsewhere",
+      write: false,
+      model: null,
+      effort: null,
+      sessionId: null,
+      sessionConfirmed: false,
+      resumeSessionId: null,
+      timeoutMs: null,
+      title: "Grok Task"
+    }
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, id, job);
+  upsertJob(repo, indexJobRecord(job));
+
+  const worker = runCompanion(["job-worker", "--cwd", repo, "--job-id", id], { env, cwd: repo });
+  assert.notEqual(worker.status, 0);
+  assert.match(worker.stderr, /refused to run job|pid 999999/i);
+  const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, id), "utf8"));
+  assert.equal(stored.status, "running");
+  assert.equal(stored.phase, "cancel-requested");
+  assert.equal(stored.pid, 999_999);
+  assert.ok(stored.request);
+});
+
 test("task rejects oversized --prompt-file before invoking Grok", (t) => {
   const root = tempDir();
   const repo = path.join(root, "repo");

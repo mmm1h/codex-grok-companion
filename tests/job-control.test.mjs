@@ -312,6 +312,162 @@ test("reconcileOrphanedJob is a no-op when the process is still alive", (t) => {
   assert.equal(observedOptions.expectedStartedAtMs, 12_345);
 });
 
+test("reconcileOrphanedJob preserves a live process while identity is unavailable", (t) => {
+  const { repo } = withStateHome(t);
+  const workerSpawnedAt = "2026-07-29T10:00:00.000Z";
+  const job = {
+    id: "task-identity-startup",
+    kind: "task",
+    status: "running",
+    phase: "starting",
+    pid: 42,
+    processName: "node",
+    processStartedAtMs: Date.parse(workerSpawnedAt),
+    workerSpawnedAt,
+    cwd: repo,
+    workspaceRoot: repo,
+    logPath: path.join(repo, "identity-startup.log"),
+    updatedAt: workerSpawnedAt
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, job.id, job);
+  saveState(repo, { config: {}, jobs: [job] });
+
+  const result = reconcileOrphanedJob(repo, job, {
+    inspectProcessImpl: () => ({ state: "identity-unavailable", identity: null }),
+    nowMs: () => Date.parse("2026-07-29T10:00:01.000Z"),
+    processIdentityGraceMs: 5_000
+  });
+  assert.equal(result.status, "running");
+  assert.equal(result.phase, "starting");
+  assert.equal(readJobFile(resolveJobFile(repo, job.id)).status, "running");
+
+  const afterGrace = reconcileOrphanedJob(repo, result, {
+    inspectProcessImpl: () => ({ state: "identity-unavailable", identity: null }),
+    nowMs: () => Date.parse("2026-07-29T10:01:00.000Z"),
+    processIdentityGraceMs: 5_000
+  });
+  assert.equal(afterGrace.status, "running");
+  assert.equal(afterGrace.pid, 42);
+});
+
+test("reconcileOrphanedJob fails a persistent identity mismatch after its grace period", (t) => {
+  const { repo } = withStateHome(t);
+  const workerSpawnedAt = "2026-07-29T10:00:00.000Z";
+  const job = {
+    id: "task-identity-mismatch",
+    kind: "task",
+    status: "running",
+    phase: "tool",
+    pid: 43,
+    processName: "node",
+    processStartedAtMs: Date.parse(workerSpawnedAt),
+    workerSpawnedAt,
+    cwd: repo,
+    workspaceRoot: repo,
+    logPath: path.join(repo, "identity-mismatch.log"),
+    updatedAt: workerSpawnedAt
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, job.id, job);
+  saveState(repo, { config: {}, jobs: [job] });
+
+  const result = reconcileOrphanedJob(repo, job, {
+    inspectProcessImpl: () => ({
+      state: "identity-mismatch",
+      identity: { pid: 43, name: "unrelated", startedAtMs: 1 }
+    }),
+    nowMs: () => Date.parse("2026-07-29T10:00:06.000Z"),
+    processIdentityGraceMs: 5_000
+  });
+  assert.equal(result.status, "failed");
+  assert.equal(result.phase, "process-identity-mismatch");
+  assert.equal(result.pid, null);
+  assert.match(result.errorMessage, /no longer matches/);
+});
+
+test("reconcileOrphanedJob respects cancellation during identity probe failures", (t) => {
+  const { repo } = withStateHome(t);
+  const workerSpawnedAt = "2026-07-29T10:00:00.000Z";
+  const base = {
+    kind: "task",
+    status: "running",
+    phase: "cancel-requested",
+    processName: "node",
+    processStartedAtMs: Date.parse(workerSpawnedAt),
+    workerSpawnedAt,
+    cancelRequestedAt: "2026-07-29T10:00:01.000Z",
+    cwd: repo,
+    workspaceRoot: repo,
+    updatedAt: workerSpawnedAt
+  };
+  const mismatch = {
+    ...base,
+    id: "task-cancel-identity-mismatch",
+    pid: 45,
+    logPath: path.join(repo, "cancel-identity-mismatch.log")
+  };
+  const unavailable = {
+    ...base,
+    id: "task-cancel-identity-unavailable",
+    pid: 46,
+    logPath: path.join(repo, "cancel-identity-unavailable.log")
+  };
+  for (const job of [mismatch, unavailable]) {
+    fs.writeFileSync(job.logPath, "", "utf8");
+    writeJobFile(repo, job.id, job);
+  }
+  saveState(repo, { config: {}, jobs: [mismatch, unavailable] });
+  const nowMs = () => Date.parse("2026-07-29T10:00:06.000Z");
+
+  const cancelled = reconcileOrphanedJob(repo, mismatch, {
+    inspectProcessImpl: () => ({
+      state: "identity-mismatch",
+      identity: { pid: 45, name: "unrelated", startedAtMs: 1 }
+    }),
+    nowMs,
+    processIdentityGraceMs: 5_000
+  });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.terminationMethod, "identity-mismatch");
+
+  const pending = reconcileOrphanedJob(repo, unavailable, {
+    inspectProcessImpl: () => ({ state: "identity-unavailable", identity: null }),
+    nowMs,
+    processIdentityGraceMs: 5_000
+  });
+  assert.equal(pending.status, "running");
+  assert.equal(pending.phase, "cancel-requested");
+  assert.equal(pending.pid, 46);
+});
+
+test("reconcileOrphanedJob still fails a genuinely dead PID immediately", (t) => {
+  const { repo } = withStateHome(t);
+  const job = {
+    id: "task-dead-process",
+    kind: "task",
+    status: "running",
+    phase: "tool",
+    pid: 44,
+    processName: "node",
+    processStartedAtMs: Date.now(),
+    workerSpawnedAt: new Date().toISOString(),
+    cwd: repo,
+    workspaceRoot: repo,
+    logPath: path.join(repo, "dead-process.log"),
+    updatedAt: new Date().toISOString()
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, job.id, job);
+  saveState(repo, { config: {}, jobs: [job] });
+
+  const result = reconcileOrphanedJob(repo, job, {
+    inspectProcessImpl: () => ({ state: "dead", identity: null })
+  });
+  assert.equal(result.status, "failed");
+  assert.equal(result.phase, "process-exited");
+});
+
 test("reconcileOrphanedJob fails a pid-less queued launch after its grace period", (t) => {
   const { repo } = withStateHome(t);
   const job = {
@@ -334,6 +490,33 @@ test("reconcileOrphanedJob fails a pid-less queued launch after its grace period
   assert.equal(result.status, "failed");
   assert.equal(result.phase, "spawn-missing");
   assert.match(result.errorMessage, /process ID/);
+});
+
+test("reconcileOrphanedJob cancels a pid-less queued launch after its grace period", (t) => {
+  const { repo } = withStateHome(t);
+  const job = {
+    id: "task-cancel-before-spawn",
+    kind: "task",
+    status: "queued",
+    phase: "cancel-requested",
+    pid: null,
+    cancelRequestedAt: "2026-07-29T10:00:01.000Z",
+    cwd: repo,
+    workspaceRoot: repo,
+    logPath: path.join(repo, "cancel-before-spawn.log"),
+    workerLaunchStartedAt: "2026-07-29T10:00:00.000Z",
+    updatedAt: "2026-07-29T10:00:01.000Z"
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, job.id, job);
+  saveState(repo, { config: {}, jobs: [job] });
+  const result = reconcileOrphanedJob(repo, job, {
+    nowMs: () => Date.parse("2026-07-29T10:01:00.000Z"),
+    pidlessQueueGraceMs: 1_000
+  });
+  assert.equal(result.status, "cancelled");
+  assert.equal(result.terminationMethod, "not-started");
+  assert.equal(result.pid, null);
 });
 
 test("buildStatusSnapshot treats --all and --limit as orthogonal", (t) => {

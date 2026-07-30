@@ -9,6 +9,7 @@ import { cancelTrackedJob, reconcileOrphanedJob } from "../plugins/grok-companio
 import {
   binaryAvailable,
   getProcessIdentity,
+  inspectProcess,
   isProcessAlive,
   processIdentityMatches,
   resolveExecutable,
@@ -244,6 +245,75 @@ test("isProcessAlive accepts optional identity guards without changing default b
       { expectedName: "grok.exe", expectedStartedAtMs: 5_100 }
     ),
     true
+  );
+});
+
+test("inspectProcess distinguishes PID death from identity probe failures", () => {
+  const signalSuccess = () => {};
+  assert.equal(
+    inspectProcess(1, {
+      killImpl: signalSuccess,
+      expectedName: "node",
+      getIdentityImpl: () => null
+    }).state,
+    "identity-unavailable"
+  );
+  assert.equal(
+    inspectProcess(1, {
+      killImpl: signalSuccess,
+      expectedName: "node",
+      expectedStartedAtMs: 1_000,
+      getIdentityImpl: () => ({ pid: 1, name: "node", startedAtMs: null })
+    }).state,
+    "identity-unavailable"
+  );
+  assert.equal(
+    inspectProcess(1, {
+      killImpl: signalSuccess,
+      expectedName: "node",
+      expectedStartedAtMs: 1_000,
+      getIdentityImpl: () => ({ pid: 1, name: "unrelated", startedAtMs: null })
+    }).state,
+    "identity-mismatch"
+  );
+  assert.equal(
+    inspectProcess(1, {
+      killImpl: signalSuccess,
+      expectedName: "node",
+      getIdentityImpl: () => ({ pid: 1, name: "unrelated", startedAtMs: 1_000 })
+    }).state,
+    "identity-mismatch"
+  );
+  assert.equal(
+    inspectProcess(1, {
+      killImpl() {
+        const error = new Error("gone");
+        error.code = "ESRCH";
+        throw error;
+      },
+      expectedName: "node"
+    }).state,
+    "dead"
+  );
+});
+
+test("Linux identity remains partial when ps start time is unavailable", {
+  skip: process.platform !== "linux"
+}, () => {
+  const identity = getProcessIdentity(process.pid, {
+    platform: "linux",
+    identityCacheMs: 0,
+    runCommandImpl: () => ({ status: 1, stdout: "", stderr: "", error: null })
+  });
+  assert.ok(identity?.name);
+  assert.equal(identity.startedAtMs, null);
+  assert.equal(
+    inspectProcess(process.pid, {
+      expectedName: identity.name,
+      expectedStartedAtMs: Date.now(),
+      getIdentityImpl: () => identity
+    }).state,
+    "identity-unavailable"
   );
 });
 
@@ -635,6 +705,61 @@ test("cancel confirms exit after an undelivered kill once an observed process di
   assert.equal(result.method, "taskkill");
   assert.ok(observedOptions.every((options) => options.expectedName === "node"));
   assert.ok(observedOptions.every((options) => options.expectedStartedAtMs === 51_510));
+});
+
+test("cancel does not treat an identity probe failure as process exit", (t) => {
+  const root = tempDir();
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  initRepo(repo);
+  const previousHome = process.env.GROK_COMPANION_HOME;
+  process.env.GROK_COMPANION_HOME = path.join(root, "state");
+  t.after(() => {
+    if (previousHome == null) delete process.env.GROK_COMPANION_HOME;
+    else process.env.GROK_COMPANION_HOME = previousHome;
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const job = {
+    id: "task-cancel-identity-unavailable",
+    kind: "task",
+    title: "Task",
+    status: "running",
+    phase: "running",
+    pid: 6161,
+    processName: "node",
+    processStartedAtMs: 61_610,
+    cwd: repo,
+    workspaceRoot: repo,
+    summary: "test",
+    createdAt: new Date().toISOString(),
+    logPath: path.join(repo, "cancel-identity-unavailable.log")
+  };
+  fs.writeFileSync(job.logPath, "", "utf8");
+  writeJobFile(repo, job.id, job);
+  upsertJob(repo, job);
+
+  let probes = 0;
+  let terminateCalls = 0;
+  const result = cancelTrackedJob(repo, job, {
+    retryDelaysMs: [],
+    sleepImpl: () => {},
+    inspectProcessImpl() {
+      probes += 1;
+      return probes === 1
+        ? { state: "alive", identity: { pid: 6161, name: "node", startedAtMs: 61_610 } }
+        : { state: "identity-unavailable", identity: null };
+    },
+    terminateImpl() {
+      terminateCalls += 1;
+      return { attempted: true, delivered: false, method: "test-signal" };
+    }
+  });
+  const stored = readJobFile(resolveJobFile(repo, job.id));
+  assert.equal(terminateCalls, 1);
+  assert.equal(result.status, "cancel-requested");
+  assert.equal(stored.status, "running");
+  assert.equal(stored.phase, "cancel-requested");
+  assert.equal(stored.pid, 6161);
 });
 
 test("cancel retries an undelivered kill until delivery succeeds", (t) => {

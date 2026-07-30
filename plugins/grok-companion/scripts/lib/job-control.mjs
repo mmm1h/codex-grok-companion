@@ -4,7 +4,7 @@ import path from "node:path";
 import process from "node:process";
 
 import {
-  isProcessAlive,
+  inspectProcess,
   PROCESS_START_TIME_SKEW_MS,
   terminateProcessTree
 } from "./process.mjs";
@@ -31,6 +31,7 @@ export const DEFAULT_LOG_TAIL_LINES = 80;
 /** Exit code when status/result --wait times out while the job is still active. */
 export const WAIT_TIMEOUT_EXIT_CODE = 124;
 export const PIDLESS_QUEUE_GRACE_MS = 15_000;
+export const PROCESS_IDENTITY_GRACE_MS = 15_000;
 /** Bounded backoff while a detached worker publishes its PID or finishes starting. */
 export const CANCEL_TERMINATE_RETRY_DELAYS_MS = [25, 50, 100, 200];
 
@@ -148,6 +149,93 @@ function identityOptions(job, options = {}) {
   };
 }
 
+function inspectTrackedProcess(job, options = {}) {
+  const guard = identityOptions(job, options);
+  if (typeof options.inspectProcessImpl === "function") {
+    return options.inspectProcessImpl(job.pid, guard);
+  }
+  // Preserve the existing test/integration hook while production uses the
+  // richer process probe.
+  if (typeof options.isProcessAliveImpl === "function") {
+    return {
+      state: options.isProcessAliveImpl(job.pid, guard) ? "alive" : "dead",
+      identity: null
+    };
+  }
+  return inspectProcess(job.pid, guard);
+}
+
+function identityGraceStartMs(job) {
+  for (const value of [
+    job.workerSpawnedAt,
+    job.workerLaunchStartedAt,
+    job.startedAt,
+    job.createdAt
+  ]) {
+    const parsed = Date.parse(value ?? "");
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return Number.isFinite(job.processStartedAtMs) ? job.processStartedAtMs : null;
+}
+
+function withinIdentityGrace(job, options = {}) {
+  const startedAtMs = identityGraceStartMs(job);
+  if (!Number.isFinite(startedAtMs)) {
+    return false;
+  }
+  const nowMs = options.nowMs?.() ?? Date.now();
+  const graceMs = options.processIdentityGraceMs ?? PROCESS_IDENTITY_GRACE_MS;
+  return nowMs - startedAtMs <= graceMs;
+}
+
+function failProcessIdentity(workspaceRoot, job) {
+  const message = `Tracked Grok process ${job.pid} is alive, but its identity no longer matches the recorded worker.`;
+  const { request: _request, ...base } = job;
+  const failed = persistJob(workspaceRoot, {
+    ...base,
+    status: "failed",
+    phase: "process-identity-mismatch",
+    pid: null,
+    completedAt: nowIso(),
+    resumable: job.kind === "task" && Boolean(job.sessionConfirmed),
+    errorMessage: message
+  });
+  appendLogLine(failed.logPath, `Failed: ${message}`);
+  return failed;
+}
+
+function cancellationWasRequested(job) {
+  return Boolean(
+    job.cancelRequestedAt
+    || job.phase === "cancel-requested"
+    || job.phase === "cancel-failed"
+  );
+}
+
+export function finalizeCancelledJob(workspaceRoot, job, options = {}) {
+  const cancelledAt = nowIso();
+  const { request: _request, ...base } = job;
+  const cancelled = persistJob(workspaceRoot, {
+    ...base,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    completedAt: cancelledAt,
+    cancelledAt: job.cancelledAt ?? cancelledAt,
+    cancelRequestedAt: job.cancelRequestedAt ?? cancelledAt,
+    terminationMethod: job.terminationMethod ?? options.terminationMethod ?? "already-exited",
+    terminationDelivered: job.terminationDelivered === true,
+    resumable: job.kind === "task" && Boolean(job.sessionConfirmed),
+    errorMessage: null
+  });
+  if (cancelled.status === "cancelled") {
+    appendLogLine(cancelled.logPath, options.logMessage ?? "Cancelled after process reconciliation.");
+  }
+  return cancelled;
+}
+
 export function reconcileOrphanedJob(workspaceRoot, job, options = {}) {
   if (!["queued", "running"].includes(job.status)) {
     return job;
@@ -163,6 +251,12 @@ export function reconcileOrphanedJob(workspaceRoot, job, options = {}) {
     if (!["queued", "running"].includes(stored.status) || stored.pid) {
       return stored;
     }
+    if (cancellationWasRequested(stored)) {
+      return finalizeCancelledJob(workspaceRoot, stored, {
+        terminationMethod: "not-started",
+        logMessage: "Cancelled after reconcile: the background worker never published a process ID."
+      });
+    }
     const message = "Background worker did not publish a process ID before the launch grace period expired.";
     const { request: _request, ...base } = stored;
     const failed = persistJob(workspaceRoot, {
@@ -177,43 +271,44 @@ export function reconcileOrphanedJob(workspaceRoot, job, options = {}) {
     appendLogLine(failed.logPath, `Failed: ${message}`);
     return failed;
   }
-  const alive = options.isProcessAliveImpl ?? isProcessAlive;
-  if (alive(job.pid, identityOptions(job, options))) {
+  const initialProbe = inspectTrackedProcess(job, options);
+  if (initialProbe.state === "alive") {
     return job;
   }
   const stored = readStoredJob(workspaceRoot, job.id) ?? job;
-  if (
-    !["queued", "running"].includes(stored.status)
-    || (stored.pid && alive(stored.pid, identityOptions(stored, options)))
-  ) {
+  if (!["queued", "running"].includes(stored.status)) {
     return stored;
   }
-  const message = `Tracked Grok process ${job.pid} exited before the job reached a terminal state.`;
-  const { request: _request, ...base } = stored;
-  const cancelWasRequested = Boolean(
-    stored.cancelRequestedAt
-    || stored.phase === "cancel-requested"
-    || stored.phase === "cancel-failed"
-  );
-  if (cancelWasRequested) {
-    const cancelledAt = nowIso();
-    const cancelled = persistJob(workspaceRoot, {
-      ...base,
-      status: "cancelled",
-      phase: "cancelled",
-      pid: null,
-      completedAt: cancelledAt,
-      cancelledAt: stored.cancelledAt ?? cancelledAt,
-      cancelRequestedAt: stored.cancelRequestedAt ?? cancelledAt,
-      terminationMethod: stored.terminationMethod ?? "already-exited",
-      terminationDelivered: stored.terminationDelivered === true,
-      resumable: stored.kind === "task" && Boolean(stored.sessionConfirmed),
-      errorMessage: null
-    });
-    if (cancelled.status === "cancelled") {
-      appendLogLine(cancelled.logPath, `Cancelled after reconcile: tracked process ${job.pid} exited following a cancel request.`);
+  const latestProbe = stored.pid
+    ? inspectTrackedProcess(stored, options)
+    : { state: "dead", identity: null };
+  if (latestProbe.state === "alive") {
+    return stored;
+  }
+  if (latestProbe.state !== "dead") {
+    // A successful signal-0 probe proves the PID is live. Missing identity
+    // evidence is not proof that the worker exited or that the PID was reused.
+    if (latestProbe.state === "identity-unavailable") {
+      return stored;
     }
-    return cancelled;
+    if (withinIdentityGrace(stored, options)) {
+      return stored;
+    }
+    if (cancellationWasRequested(stored)) {
+      return finalizeCancelledJob(workspaceRoot, stored, {
+        terminationMethod: "identity-mismatch",
+        logMessage: `Cancelled after reconcile: recorded process ${stored.pid} no longer matched the worker identity.`
+      });
+    }
+    return failProcessIdentity(workspaceRoot, stored);
+  }
+  const message = `Tracked Grok process ${stored.pid ?? job.pid} exited before the job reached a terminal state.`;
+  const { request: _request, ...base } = stored;
+  if (cancellationWasRequested(stored)) {
+    return finalizeCancelledJob(workspaceRoot, stored, {
+      terminationMethod: "already-exited",
+      logMessage: `Cancelled after reconcile: tracked process ${stored.pid ?? job.pid} exited following a cancel request.`
+    });
   }
   const failed = persistJob(workspaceRoot, {
     ...base,
@@ -292,7 +387,6 @@ export function cancelTrackedJob(workspaceRoot, job, options = {}) {
     };
   }
 
-  const alive = options.isProcessAliveImpl ?? isProcessAlive;
   const terminate = options.terminateImpl ?? terminateProcessTree;
   const sleep = options.sleepImpl ?? sleepSyncMs;
   const retryDelays = options.retryDelaysMs ?? CANCEL_TERMINATE_RETRY_DELAYS_MS;
@@ -328,41 +422,48 @@ export function cancelTrackedJob(workspaceRoot, job, options = {}) {
       continue;
     }
 
-    const guard = identityOptions(latestSnapshot, options);
-    const currentlyAlive = alive(lastPid, guard);
-    if (currentlyAlive) {
+    const processSnapshot = { ...latestSnapshot, pid: lastPid };
+    const probe = inspectTrackedProcess(processSnapshot, options);
+    if (probe.state === "alive") {
       sawAlive = true;
-    } else if (sawAlive) {
+    } else if (probe.state === "dead" && sawAlive) {
       confirmedExit = true;
       break;
     }
 
-    try {
-      const result = terminate(lastPid, {
-        cwd: latestSnapshot.cwd ?? requested.cwd,
-        env: options.env,
-        ...guard
-      });
-      termination = {
-        attempted: true,
-        delivered: Boolean(result?.delivered),
-        method: result?.method ?? null
-      };
-    } catch (error) {
-      terminationError = error instanceof Error ? error.message : String(error);
-      termination = { attempted: true, delivered: false, method: termination.method ?? null };
+    if (probe.state === "alive") {
+      const guard = identityOptions(processSnapshot, options);
+      try {
+        const result = terminate(lastPid, {
+          cwd: latestSnapshot.cwd ?? requested.cwd,
+          env: options.env,
+          ...guard
+        });
+        termination = {
+          attempted: true,
+          delivered: Boolean(result?.delivered),
+          method: result?.method ?? null
+        };
+      } catch (error) {
+        terminationError = error instanceof Error ? error.message : String(error);
+        termination = { attempted: true, delivered: false, method: termination.method ?? null };
+      }
     }
 
     if (termination.delivered) {
       break;
     }
 
-    if (!alive(lastPid, guard)) {
+    const afterProbe = inspectTrackedProcess(
+      { ...(readStoredJob(workspaceRoot, job.id) ?? latestSnapshot), pid: lastPid },
+      options
+    );
+    if (afterProbe.state === "dead") {
       if (sawAlive) {
         confirmedExit = true;
         break;
       }
-    } else {
+    } else if (afterProbe.state === "alive") {
       sawAlive = true;
     }
 
@@ -423,7 +524,8 @@ export function cancelTrackedJob(workspaceRoot, job, options = {}) {
     return { job: pending, previousStatus: stored.status, status: "cancel-requested", delivered: false, method: null, errorMessage: pendingMessage };
   }
 
-  if (alive(lastPid, identityOptions(latestSnapshot, options))) {
+  const finalProbe = inspectTrackedProcess({ ...latestSnapshot, pid: lastPid }, options);
+  if (finalProbe.state === "alive") {
     const errorMessage = terminationError || `Could not terminate process ${lastPid}; it is still running.`;
     const failed = persistJob(workspaceRoot, {
       ...latestSnapshot,
