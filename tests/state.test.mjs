@@ -332,17 +332,26 @@ test("concurrent state writers retain every job", async (t) => {
     fs.rmSync(root, { recursive: true, force: true });
   });
   const fixture = fileURLToPath(new URL("./state-writer-fixture.mjs", import.meta.url));
-  await Promise.all(
+  const writers = await Promise.allSettled(
     Array.from({ length: 8 }, (_value, index) => new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [fixture, root, `parallel-${index}`], {
         env: { ...process.env, GROK_COMPANION_HOME: stateHome },
         windowsHide: true,
-        stdio: "ignore"
+        stdio: ["ignore", "ignore", "pipe"]
+      });
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
       });
       child.once("error", reject);
-      child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`state writer exited ${code}`)));
+      child.once("close", (code) => code === 0
+        ? resolve()
+        : reject(new Error(`state writer parallel-${index} exited ${code}: ${stderr.trim() || "(no stderr)"}`)));
     }))
   );
+  const failures = writers.filter((result) => result.status === "rejected");
+  assert.deepEqual(failures, [], failures.map((result) => result.reason?.stack ?? result.reason).join("\n"));
   const ids = new Set(listJobs(root).map((job) => job.id));
   assert.equal(ids.size, 8);
   for (let index = 0; index < 8; index += 1) {
