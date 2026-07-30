@@ -1,0 +1,28 @@
+{
+  "name": "grok-companion",
+  "version": "0.1.0",
+  "description": "Use the local Grok CLI from Codex for code review, delegated coding tasks, and tracked background jobs.",
+  "author": {
+    "name": "mmm1h",
+    "url": "https://github.com/mmm1h"
+  },
+  "homepage": "https://github.com/mmm1h/codex-grok-companion#readme",
+  "repository": "https://github.com/mmm1h/codex-grok-companion",
+  "license": "Apache-2.0",
+  "keywords": ["codex", "grok", "code-review", "delegation", "background-jobs"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Grok Companion",
+    "shortDescription": "Consult Grok for reviews and coding tasks",
+    "longDescription": "Run structured read-only reviews, delegate coding work, and manage durable background Grok jobs through the local Grok CLI. The same plugin works in Codex CLI and Codex in the ChatGPT desktop app.",
+    "developerName": "mmm1h",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "websiteURL": "https://github.com/mmm1h/codex-grok-companion",
+    "defaultPrompt": [
+      "Ask Grok to review my current changes.",
+      "Delegate this investigation to Grok in the background.",
+      "Show the status of my recent Grok jobs."
+    ]
+  }
+}

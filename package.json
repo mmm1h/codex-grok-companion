@@ -1,0 +1,15 @@
+{
+  "name": "@mmm1h/codex-grok-companion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Use the local Grok CLI from Codex for reviews, delegated coding tasks, and background jobs.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "test:smoke": "node plugins/grok-companion/scripts/grok-companion.mjs setup --json"
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Grok Review"
+  short_description: "Run a structured read-only Grok code review"
+  default_prompt: "Use $grok-review to review the current Git changes with Grok."

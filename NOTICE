@@ -1,0 +1,13 @@
+codex-grok-companion
+Copyright 2026 mmm1h
+
+Licensed under the Apache License, Version 2.0.
+
+The Grok CLI runtime and job-control modules derive from
+mmm1h/claude-plugin-grok, Copyright 2026 mmm1h, distributed under the Apache
+License, Version 2.0.
+
+The companion architecture was informed by openai/codex-plugin-cc, Copyright
+OpenAI, L.L.C., also distributed under the Apache License, Version 2.0. This
+project does not copy or include the Codex app server, broker, or generated
+protocol bindings.
